@@ -12,12 +12,30 @@ from tqdm import tqdm
 # =================================================================
 
 # Colunas de Features (Coordenadas X, Y das partes do corpo)
-FEATURE_COLUMNS = [
-    'mouse1_nose_x', 'mouse1_nose_y', 'mouse1_tail_base_x', 'mouse1_tail_base_y', 'mouse1_body_center_x', 'mouse1_body_center_y', 'mouse1_ear_left_x', 'mouse1_ear_left_y', 'mouse1_ear_right_x', 'mouse1_ear_right_y',
-    'mouse2_nose_x', 'mouse2_nose_y', 'mouse2_tail_base_x', 'mouse2_tail_base_y', 'mouse2_body_center_x', 'mouse2_body_center_y', 'mouse2_ear_left_x', 'mouse2_ear_left_y', 'mouse2_ear_right_x', 'mouse2_ear_right_y',
-    'mouse3_nose_x', 'mouse3_nose_y', 'mouse3_tail_base_x', 'mouse3_tail_base_y', 'mouse3_body_center_x', 'mouse3_body_center_y', 'mouse3_ear_left_x', 'mouse3_ear_left_y', 'mouse3_ear_right_x', 'mouse3_ear_right_y',
-    'mouse4_nose_x', 'mouse4_nose_y', 'mouse4_tail_base_x', 'mouse4_tail_base_y', 'mouse4_body_center_x', 'mouse4_body_center_y', 'mouse4_ear_left_x', 'mouse4_ear_left_y', 'mouse4_ear_right_x', 'mouse4_ear_right_y',
+# Todas as 24 partes do corpo por mouse:
+BODY_PARTS = [
+    'body_center', 'ear_left', 'ear_right', 'forepaw_left', 'forepaw_right',
+    'hindpaw_left', 'hindpaw_right', 'neck', 'nose', 'tail_base',
+    'tail_midpoint', 'tail_tip', 'hip_left', 'hip_right'
 ]
+
+FEATURE_COORDS_CM = []
+# Gera as 96 colunas (em CM)
+for m in range(1, 5):
+    for bp in BODY_PARTS:
+        FEATURE_COORDS_CM.append(f'mouse{m}_{bp}_cm_x')
+        FEATURE_COORDS_CM.append(f'mouse{m}_{bp}_cm_y')
+
+# Features de Movimento e Interação
+MOVEMENT_FEATURES = [
+    'mouse1_speed_cm_per_frame', 'mouse2_speed_cm_per_frame', 
+    'mouse3_speed_cm_per_frame', 'mouse4_speed_cm_per_frame',
+    'dist_m1_m2_cm',
+    # Adicione as outras distâncias que você calcular (m1-m3, m1-m4, m2-m3, etc.)
+]
+
+# Nova FEATURE_COLUMNS
+FEATURE_COLUMNS = FEATURE_COORDS_CM + MOVEMENT_FEATURES
 TARGET_COLUMN = 'behavior' 
 
 def load_parquet_row(file_path: Path, row_index: int, columns: List[str]) -> pd.DataFrame:
@@ -170,7 +188,7 @@ class LazyFrameDataset(Dataset):
 
 if __name__ == "__main__":
     # ❗ Altere este caminho: Mude para o diretório raiz dos seus arquivos Parquet
-    base_path = Path("MABe-mouse-behavior-detection/processed_videos_final_fixed")
+    base_path = Path("MABe-mouse-behavior-detection/feature_engineered_data")
     
     parquet_files = list(base_path.rglob("*.parquet"))
 
