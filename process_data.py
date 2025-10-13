@@ -1,26 +1,18 @@
-# process_data.py
+# process_data.py - Versão 7.0 (Fixando Colunas Faltantes)
 
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-# ... (o resto dos seus imports)
-
-
-# =================================================================
-# 1. Definição da Pipeline de Feature Engineering (Função SUBSTITUÍDA)
-# =================================================================
+from typing import List
 
 # Colunas de metadados BRUTOS que queremos manter no arquivo final (além das features)
-# NOTA: Removemos daqui as colunas que serão OHE ou normalizadas!
 METADATA_COLUMNS_TO_KEEP_RAW = [
     'frame', 'behavior', 'video_id', 'unique_frame_id',
     'lab_id', 
-    # Mantemos algumas informações estáticas que não serão OHE/normalizadas
     'frames_per_second', 'video_duration_sec', 'pix_per_cm_approx', 
     'video_width_pix', 'video_height_pix', 
     'body_parts_tracked', 'behaviors_labeled', 'tracking_method',
-    # Mantemos strain, color, condition, id (você pode remover se quiser manter o dataset mais limpo)
     'mouse1_strain', 'mouse1_color', 'mouse1_condition', 'mouse1_id',
     'mouse2_strain', 'mouse2_color', 'mouse2_condition', 'mouse2_id',
     'mouse3_strain', 'mouse3_color', 'mouse3_condition', 'mouse3_id',
@@ -32,49 +24,85 @@ def pipeline_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     """Aplica o feature engineering completo a um ÚNICO arquivo Parquet."""
     
     if df.empty:
-        return df
+        return pd.DataFrame()
 
-    # Encontra TODAS as colunas de coordenadas (_x, _y)
-    coord_cols = [col for col in df.columns 
+    df = df.copy() 
+    
+    # --------------------------------------------------------------------------------
+    # 1. Pré-processamento e Normalização CM
+    # --------------------------------------------------------------------------------
+    coord_cols_raw = [col for col in df.columns 
                   if (col.endswith('_x') or col.endswith('_y')) and col.startswith('mouse')]
 
-    # 2a. Padroniza 0.0 como NaN nas coordenadas (Assume que 0.0 significa 'não detectado')
-    df.loc[:, coord_cols] = df.loc[:, coord_cols].replace(0.0, np.nan)
+    # 1a. Garante que as colunas críticas são numéricas (Manutenção da Correção de Tipagem)
+    for col in coord_cols_raw:
+        # Converte para float, forçando strings inválidas/malformadas para NaN
+        df.loc[:, col] = pd.to_numeric(df[col], errors='coerce').astype(float)
+    
+    # Garante que o fator de normalização é numérico para evitar o erro de divisão
+    if 'pix_per_cm_approx' in df.columns:
+        df.loc[:, 'pix_per_cm_approx'] = pd.to_numeric(df['pix_per_cm_approx'], errors='coerce').astype(float)
+    
+    # 1b. Padroniza 0.0 como NaN
+    df.loc[:, coord_cols_raw] = df.loc[:, coord_cols_raw].replace(0.0, np.nan)
 
-    # 2b. Interpolação Linear 
-    for col in coord_cols:
+    # 1c. Interpolação Linear 
+    for col in coord_cols_raw:
         df.loc[:, col] = df.groupby('video_id')[col].transform(
              lambda x: x.interpolate(method='linear', limit=10, limit_direction='both')
-        ).copy()
-
-    # 3. Normalização: Pixels para Centímetros (CM)
-    for col in coord_cols:
-        col_cm = col.replace('_x', '_cm_x').replace('_y', '_cm_y')
-        df.loc[:, col_cm] = df[col] / df['pix_per_cm_approx']
+        )
     
-    # Lista as novas colunas CM criadas
-    cm_cols = [col for col in df.columns if col.endswith('_cm_x') or col.endswith('_cm_y')]
+    # 1d. CALCULA O CENTRO DO CORPO (CORREÇÃO ERRO 'Column not found') ❗
+    center_cols_pix = []
+    for m in range(1, 5):
+        hip_left_x = f'mouse{m}_hip_left_x'
+        hip_right_x = f'mouse{m}_hip_right_x'
+        hip_left_y = f'mouse{m}_hip_left_y'
+        hip_right_y = f'mouse{m}_hip_right_y'
+        
+        center_x = f'mouse{m}_body_center_x'
+        center_y = f'mouse{m}_body_center_y'
 
+        # Verifica se as colunas de quadril existem para o mouse 'm'
+        if hip_left_x in df.columns and hip_right_x in df.columns:
+            # Calcula a média no espaço de pixels e garante que é float
+            df.loc[:, center_x] = ((df[hip_left_x] + df[hip_right_x]) / 2.0).astype(float)
+            df.loc[:, center_y] = ((df[hip_left_y] + df[hip_right_y]) / 2.0).astype(float)
+            center_cols_pix.extend([center_x, center_y])
+    
+    # Lista FINAL de todas as colunas de coordenadas (pixels) a serem normalizadas
+    all_coord_cols_pix = coord_cols_raw + center_cols_pix
 
-    # 4. Criação de Features de Movimento (Velocidade)
+    # 1e. Normalização: Pixels para Centímetros (CM)
+    df_cm = pd.DataFrame(index=df.index) 
+    cm_cols = []
+    for col in all_coord_cols_pix:
+        # Renomeia para o padrão de CM
+        col_cm = col.replace('_x', '_cm_x').replace('_y', '_cm_y')
+        df_cm.loc[:, col_cm] = (df[col] / df['pix_per_cm_approx']).astype(float) 
+        cm_cols.append(col_cm)
+
+    # --------------------------------------------------------------------------------
+    # 2. Geração de Features de Velocidade e Distância (USANDO APENAS df_cm) 
+    # --------------------------------------------------------------------------------
+    
+    df_kinematics = pd.DataFrame(index=df.index) 
+    speed_cols = []
+    
+    # 2a. Velocidade
     for m in range(1, 5):
         center_x_cm = f'mouse{m}_body_center_cm_x'
         center_y_cm = f'mouse{m}_body_center_cm_y'
         
-        # Calcula a diferença de X e Y entre frames
-        df.loc[:, f'mouse{m}_delta_x'] = df.groupby('video_id')[center_x_cm].diff().copy()
-        df.loc[:, f'mouse{m}_delta_y'] = df.groupby('video_id')[center_y_cm].diff().copy()
-        
-        # Calcula a velocidade 
-        df.loc[:, f'mouse{m}_speed_cm_per_frame'] = np.sqrt(
-            df[f'mouse{m}_delta_x']**2 + df[f'mouse{m}_delta_y']**2
-        ).copy()
+        if center_x_cm in df_cm.columns: # Agora a coluna existe em df_cm!
+            delta_x = df_cm.groupby(df['video_id'])[center_x_cm].diff() 
+            delta_y = df_cm.groupby(df['video_id'])[center_y_cm].diff()
+            
+            speed_col_name = f'mouse{m}_speed_cm_per_frame'
+            df_kinematics.loc[:, speed_col_name] = np.sqrt(delta_x**2 + delta_y**2)
+            speed_cols.append(speed_col_name)
 
-    # Lista as novas colunas de velocidade
-    speed_cols = [f'mouse{m}_speed_cm_per_frame' for m in range(1, 5)]
-
-
-    # 5. Criação de Features de Interação (Distância entre Ratos)
+    # 2b. Distância Social
     mouse_pairs = [(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)]
     dist_cols = []
     for m1, m2 in mouse_pairs:
@@ -83,75 +111,67 @@ def pipeline_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
         center1_y = f'mouse{m1}_body_center_cm_y'
         center2_x = f'mouse{m2}_body_center_cm_x'
         center2_y = f'mouse{m2}_body_center_cm_y'
-
-        df.loc[:, dist_col_name] = np.sqrt(
-            (df[center1_x] - df[center2_x])**2 +
-            (df[center1_y] - df[center2_y])**2
-        )
-        dist_cols.append(dist_col_name)
-
+        
+        if center1_x in df_cm.columns and center2_x in df_cm.columns:
+            df_kinematics.loc[:, dist_col_name] = np.sqrt(
+                (df_cm[center1_x] - df_cm[center2_x])**2 +
+                (df_cm[center1_y] - df_cm[center2_y])**2
+            )
+            dist_cols.append(dist_col_name)
     
     # --------------------------------------------------------------------------------
-    # 6. ❗ INCLUSÃO E PROCESSAMENTO DE METADADOS (OHE e Normalização) ❗
+    # 3. Processamento de Metadados (OHE e Normalização)
     # --------------------------------------------------------------------------------
     
-    # Colunas Categóricas para One-Hot Encoding (OHE)
     CATEGORICAL_COLS = [
         'arena_type', 'arena_shape', 
         'mouse1_sex', 'mouse2_sex', 'mouse3_sex', 'mouse4_sex',
     ]
-
-    # Colunas Numéricas Contextuais para Normalização (Idade e Dimensões da Arena)
     NUMERIC_CONTEXT_COLS = [
         'mouse1_age', 'mouse2_age', 'mouse3_age', 'mouse4_age',
         'arena_width_cm', 'arena_height_cm',
     ]
+
+    df_context = df[CATEGORICAL_COLS + NUMERIC_CONTEXT_COLS].copy()
+
+    # 3a. One-Hot Encoding (OHE)
+    df_context = pd.get_dummies(df_context, columns=CATEGORICAL_COLS, dummy_na=False)
+    ohe_cols = [col for col in df_context.columns if any(c in col for c in CATEGORICAL_COLS)]
     
-    # --- 6a. One-Hot Encoding (OHE) ---
-    # Aplica OHE e adiciona as novas colunas (ex: 'arena_type_OpenField')
-    # Nota: get_dummies lida bem com NaNs, mas 'dummy_na=True' criaria uma coluna '_nan'
-    df = pd.get_dummies(df, columns=CATEGORICAL_COLS, dummy_na=False)
-    
-    # Encontra as colunas OHE que foram criadas
-    ohe_cols = [col for col in df.columns if any(c in col for c in CATEGORICAL_COLS)]
-    
-    # --- 6b. Normalização de Variáveis Numéricas ---
+    # 3b. Normalização de Variáveis Numéricas (MinMax)
+    numeric_context_norm_cols = []
     for col in NUMERIC_CONTEXT_COLS:
-        if col in df.columns:
-            # Garante que a coluna não será incluída no final com o nome antigo
-            df.rename(columns={col: f'{col}_norm'}, inplace=True) 
+        if col in df_context.columns:
+            df_context.loc[:, col] = pd.to_numeric(df_context[col], errors='coerce').astype(float)
+            df_context.rename(columns={col: f'{col}_norm'}, inplace=True) 
             col_norm = f'{col}_norm'
 
-            min_val = df[col_norm].min()
-            max_val = df[col_norm].max()
+            min_val = df_context[col_norm].min()
+            max_val = df_context[col_norm].max()
             
             if (max_val - min_val) != 0:
-                # Aplica MinMax Scaler
-                df.loc[:, col_norm] = ((df[col_norm] - min_val) / (max_val - min_val)).copy()
+                df_context.loc[:, col_norm] = ((df_context[col_norm] - min_val) / (max_val - min_val))
             else:
-                # Caso todos os valores sejam iguais, define como 0
-                df.loc[:, col_norm] = 0.0
-
-    # Lista as novas colunas numéricas normalizadas
-    numeric_context_norm_cols = [f'{col}_norm' for col in NUMERIC_CONTEXT_COLS if f'{col}_norm' in df.columns]
-
-    # --------------------------------------------------------------------------------
-    # 7. ❗ SELEÇÃO FINAL DE COLUNAS ❗
-    # --------------------------------------------------------------------------------
-
-    final_cols = (
-        METADATA_COLUMNS_TO_KEEP_RAW + # Metadados estáticos (frame, behavior, id, etc.)
-        cm_cols +                      # Coordenadas Normalizadas (CM)
-        speed_cols +                   # Velocidade
-        dist_cols +                    # Distância Social
-        ohe_cols +                     # Metadados Categóricos OHE
-        numeric_context_norm_cols      # Metadados Numéricos Normalizados
-    )
+                df_context.loc[:, col_norm] = 0.0
+            
+            numeric_context_norm_cols.append(col_norm)
     
-    # Garante que as colunas existem e remove duplicatas acidentais
-    df_processed = df[list(set(final_cols) & set(df.columns))]
+    # --------------------------------------------------------------------------------
+    # 4. Concatenação Final
+    # --------------------------------------------------------------------------------
     
-    return df_processed.reset_index(drop=True)
+    base_cols = list(set(METADATA_COLUMNS_TO_KEEP_RAW) & set(df.columns))
+    df_final = df[base_cols].copy()
+
+    df_final = pd.concat([
+        df_final, 
+        df_cm, 
+        df_kinematics, 
+        df_context[ohe_cols + numeric_context_norm_cols]
+    ], axis=1)
+    
+    return df_final.reset_index(drop=True)
+# ... (O restante do script if __name__ == "__main__": permanece o mesmo)
 
 # =================================================================
 # 2. Execução da Pipeline
