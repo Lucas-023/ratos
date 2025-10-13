@@ -152,3 +152,40 @@ def pipeline_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     df_processed = df[list(set(final_cols) & set(df.columns))]
     
     return df_processed.reset_index(drop=True)
+
+# =================================================================
+# 2. Execução da Pipeline
+# =================================================================
+
+if __name__ == "__main__":
+    # ❗ Altere estas pastas 
+    INPUT_PATH = Path("MABe-mouse-behavior-detection/processed_videos_final_fixed") 
+    OUTPUT_PATH = Path("MABe-mouse-behavior-detection/feature_engineered_data")
+    
+    OUTPUT_PATH.mkdir(parents=True, exist_ok=True) # Cria a pasta de saída se não existir
+    
+    parquet_files = list(INPUT_PATH.rglob("*.parquet"))
+
+    if not parquet_files:
+        print(f"❌ NENHUM arquivo Parquet encontrado na pasta de entrada: {INPUT_PATH.absolute()}")
+    else:
+        print(f"🔍 Encontrados {len(parquet_files)} arquivos para processar.")
+        
+        # O loop de processamento deve ser lento, monitorado pelo tqdm
+        for file_path in tqdm(parquet_files, desc="Processando Features"):
+            try:
+                # 1. Carrega
+                df_raw = pd.read_parquet(file_path, engine='fastparquet')
+                
+                # 2. Processa
+                df_processed = pipeline_feature_engineering(df_raw)
+                
+                # 3. Salva no novo caminho
+                output_file = OUTPUT_PATH / file_path.name
+                df_processed.to_parquet(output_file, engine='fastparquet', index=False)
+                
+            except Exception as e:
+                print(f"\n⚠️ ERRO FATAL ao processar {file_path.name}: {e}. Pulando.")
+                continue
+
+        print("\n✅ Processamento de Features concluído. Os dados estão prontos na pasta:", OUTPUT_PATH)
