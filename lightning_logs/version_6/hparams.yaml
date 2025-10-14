@@ -1,0 +1,5 @@
+hidden_size: 256
+input_size: 118
+lr: 0.0001
+num_classes: 37
+num_layers: 2
