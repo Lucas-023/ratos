@@ -35,7 +35,7 @@ MOVEMENT_FEATURES = [
 ]
 
 # Nova FEATURE_COLUMNS
-FEATURE_COLUMNS = FEATURE_COORDS_CM + MOVEMENT_FEATURES
+FEATURE_COLUMNS = FEATURE_COORDS_CM + MOVEMENT_FEATURES + ["frames_per_second"]
 TARGET_COLUMN = 'behavior' 
 
 def load_parquet_row(file_path: Path, row_index: int, columns: List[str]) -> pd.DataFrame:
@@ -181,7 +181,58 @@ class LazyFrameDataset(Dataset):
             dummy_X = torch.zeros(len(self.features), dtype=torch.float32)
             dummy_y = torch.zeros(num_classes, dtype=torch.float32)
             return dummy_X, dummy_y
+    
+    # No seu arquivo dataloader.py, dentro da classe LazyFrameDataset:
 
+    def get_sequence_data(self, idx: int, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Lê uma sequência de 'seq_len' frames do disco em UMA ÚNICA operação I/O.
+        """
+        # 1. Encontra o caminho do arquivo e o índice inicial
+        try:
+            file_path, start_index = self.frame_map[idx]
+            # Verifica se a sequência inteira está dentro do mesmo arquivo.
+            # Se a sequência cruzar o limite de um arquivo, esta linha falhará ou
+            # apontará para um arquivo diferente, o que trataremos a seguir.
+            end_path, _ = self.frame_map[idx + seq_len - 1]
+        except IndexError:
+             # Se o índice final estiver fora do mapa (fim do dataset)
+            raise IndexError("Sequence index out of bounds")
+
+        if file_path != end_path:
+            # Se a sequência cruzar o limite de um arquivo, não podemos usar o bulk read
+            # e a sequência deve ser descartada ou tratada separadamente.
+            # Para simplificar, neste caso, o SequenceDataset deve pular este índice.
+            raise ValueError("Sequence crosses file boundary.")
+        
+        # 2. Carrega o BLOCO de dados do arquivo (I/O eficiente!)
+        cols_to_load = self.features + [self.target]
+        
+        df = pd.read_parquet(
+            file_path, 
+            engine='fastparquet', 
+            columns=cols_to_load
+        )
+        # Seleciona as linhas desejadas (a sequência)
+        seq_rows = df.iloc[start_index : start_index + seq_len]
+
+        # 3. Processamento das Features (X)
+        X_seq_df = seq_rows[self.features]
+        X_seq = torch.tensor(X_seq_df.values, dtype=torch.float32)
+
+        # 4. Processamento do Target (y) - Apenas o último frame
+        Y_label_raw = seq_rows[self.target].iloc[-1]
+        labels_present = safe_extract_labels(Y_label_raw)
+        
+        num_classes = len(self.target_map)
+        y_multi_hot = torch.zeros(num_classes, dtype=torch.float32)
+        
+        for label in labels_present:
+            if label in self.target_map:
+                y_multi_hot[self.target_map[label]] = 1.0 
+
+        # X_seq terá a forma (seq_len, input_size)
+        return X_seq, y_multi_hot
 # =================================================================
 # 3. Exemplo de Uso
 # =================================================================
