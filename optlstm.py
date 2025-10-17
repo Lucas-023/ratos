@@ -9,6 +9,16 @@ from typing import Tuple, List, Any
 from tqdm import tqdm
 import os 
 
+# ============================================================
+# CONFIGURAÇÕES DE PERFORMANCE MÁXIMA (LINUX/A4500)
+# ============================================================
+# ✅ Adição 1: Otimização da GPU (Tensor Cores) - Essencial para A4500
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision('medium') 
+    PIN_MEMORY = True # Define Pin Memory aqui, conforme discutido
+else:
+    PIN_MEMORY = False
+
 # --- IMPORTAÇÕES (ASSUMINDO SEUS ARQUIVOS CONSOLIDADOS SÃO COMPATÍVEIS) ---
 try:
     from dataloader import FEATURE_COLUMNS, TARGET_COLUMN 
@@ -30,6 +40,7 @@ X_STD_PATH = "X_std.npy"
 SEQ_LEN = 30
 INPUT_SIZE = len(FEATURE_COLUMNS) # 117
 BATCH_SIZE = 256 
+# Mantido conforme seu pedido: usa todos os cores no Linux, 0 no Windows
 NUM_WORKERS = os.cpu_count() if os.name != 'nt' else 0 
 
 
@@ -47,7 +58,7 @@ class MemmapSequenceDataset(Dataset):
         self.Y_labels = df_y.iloc[:, 0].tolist() 
         
         self.total_frames = len(self.Y_labels) 
-        self.n_features = INPUT_SIZE          
+        self.n_features = INPUT_SIZE 
         
         # 2. Mapeamento de Features (X) - USANDO np.memmap
         print(f"Carregando features (X) de {CONSOLIDATED_X_PATH} via Memmap...")
@@ -96,7 +107,7 @@ class MemmapSequenceDataset(Dataset):
         return target_map
 
     def _calculate_pos_weight(self):
-        """Calcula o pos_weight (Negativos / Positivos) para BCEWithLogitsLoss."""
+        """Calcula o pos_weight (Negativos / Positivos) para BCEWithLogitsLoss com CLIPPING."""
         num_classes = len(self.target_map)
         pos_counts = np.zeros(num_classes, dtype=np.float64)
         total_frames = self.total_frames
@@ -117,6 +128,10 @@ class MemmapSequenceDataset(Dataset):
         
         # pos_weight = (Negativos / Positivos). Quanto mais raro, maior o peso.
         pos_weight = neg_counts / pos_counts_safe
+        
+        # ✅ Adição 2: CLIPPING CRÍTICO: Limita o peso máximo (1000.0) para evitar NaN na perda.
+        MAX_POS_WEIGHT = 1000.0 
+        pos_weight[pos_weight > MAX_POS_WEIGHT] = MAX_POS_WEIGHT 
         
         print(f"✅ Pesos Calculados. Exemplo de Peso (Classe mais rara): {np.max(pos_weight):.2f}")
         return torch.from_numpy(pos_weight).float()
@@ -167,7 +182,7 @@ class LSTMBehaviorModel(pl.LightningModule):
 
     def forward(self, x):
         out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])  
+        out = self.fc(out[:, -1, :]) 
         return out
 
     def training_step(self, batch, batch_idx):
@@ -196,11 +211,11 @@ if __name__ == "__main__":
 
     # Verifica se os arquivos consolidados e estatísticos existem
     if not all(Path(p).exists() for p in [CONSOLIDATED_X_PATH, CONSOLIDATED_Y_PATH, X_MEAN_PATH, X_STD_PATH]):
-         print("----------------------------------------------------------------------")
-         print("❌ ARQUIVOS CONSOLIDADOS OU ESTATÍSTICAS NÃO ENCONTRADOS.")
-         print("Você DEVE rodar o 'consolidate_data.py' modificado primeiro.")
-         print("----------------------------------------------------------------------")
-         exit()
+          print("----------------------------------------------------------------------")
+          print("❌ ARQUIVOS CONSOLIDADOS OU ESTATÍSTICAS NÃO ENCONTRADOS.")
+          print("Você DEVE rodar o 'consolidate_data.py' modificado primeiro.")
+          print("----------------------------------------------------------------------")
+          exit()
     
     # Cria o dataset otimizado (ELE CALCULA O POS_WEIGHT AQUI)
     full_dataset = MemmapSequenceDataset(seq_len=SEQ_LEN)
@@ -213,11 +228,11 @@ if __name__ == "__main__":
     train_ds = torch.utils.data.Subset(full_dataset, range(0, train_size))
     val_ds = torch.utils.data.Subset(full_dataset, range(train_size, total_sequences))
 
-    # DataLoaders 
+    # DataLoaders (AGORA USA O PIN_MEMORY DEFINIDO NO INÍCIO)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, 
-                              num_workers=NUM_WORKERS, pin_memory=True)
+                              num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, 
-                            num_workers=NUM_WORKERS, pin_memory=True)
+                            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
 
     # Inicialização do Modelo (A PONTE)
     # 🚨 PONTO CRÍTICO 4: Passa o pos_weight CALCULADO do Dataset para o Modelo
@@ -242,5 +257,5 @@ if __name__ == "__main__":
         gradient_clip_algorithm="norm" 
     )
 
-    print("\n🚀 Iniciando treinamento com Ponderação de Perda (Deve ser estável!)...")
+    print("\n🚀 Iniciando treinamento com Ponderação de Perda (Otimizado e Estável para Linux!)...")
     trainer.fit(model, train_loader, val_loader)
