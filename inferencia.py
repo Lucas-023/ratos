@@ -22,7 +22,7 @@ except ImportError:
 
 # 🚨 AJUSTE AQUI: Caminho para o CHECKPOINT (pesos) do seu melhor modelo treinado
 # Certifique-se de que este caminho está correto.
-CHECKPOINT_PATH = Path("lightning_logs/version_14/checkpoints/epoch=9-step=1113270.ckpt") 
+CHECKPOINT_PATH = Path("lightning_logs/version_10/checkpoints/epoch=24-step=2783175.ckpt") 
 
 # Caminhos dos arquivos
 CONSOLIDATED_TEST_X_PATH = Path("consolidated_TEST_X.npy")
@@ -122,7 +122,8 @@ def run_test_inference(checkpoint_path: Path):
         num_layers=hparams['num_layers'],
         num_classes=len(BEHAVIOR_MAP), # Usa o número correto de classes do mapa carregado
         lr=hparams['lr'],
-        weight_decay=weight_decay_val  # ✅ NOVO: Adiciona weight_decay
+        dropout_rate=0.35,
+        weight_decay=weight_decay_val,  # ✅ NOVO: Adiciona weight_decay
         # pos_weight_tensor removido
     )
     

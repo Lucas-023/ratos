@@ -77,7 +77,7 @@ INPUT_SIZE = len(FEATURE_COLUMNS) # 117
 BATCH_SIZE = 256 
 NUM_WORKERS = os.cpu_count() if os.name != 'nt' else 0 
 
-LEARNING_RATE = 1e-3  
+LEARNING_RATE = 1e-5
 WEIGHT_DECAY = 1e-4    
 
 
@@ -170,15 +170,21 @@ class MemmapSequenceDataset(Dataset):
 
 class LSTMBehaviorModel(pl.LightningModule):
     
-    def __init__(self, input_size, hidden_size, num_layers, num_classes, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY):
+    def __init__(self, input_size, hidden_size, num_layers, num_classes,dropout_rate, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY):
         super().__init__()
         self.save_hyperparameters() 
         
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, num_classes)
+        self.lstm = nn.LSTM(
+            input_size, 
+            self.hparams.hidden_size, 
+            self.hparams.num_layers, 
+            batch_first=True,
+            dropout=self.hparams.dropout_rate if self.hparams.num_layers > 1 else 0 # Dropout só funciona entre camadas
+        )
+        self.fc = nn.Linear(self.hparams.hidden_size, self.hparams.num_classes)
         
         # ✅ NOVO: Usa a classe BinaryFocalLoss implementada localmente
-        self.loss_fn = BinaryFocalLoss(gamma=1.0) 
+        self.loss_fn = BinaryFocalLoss(gamma=0.5) 
 
     def forward(self, x):
         out, _ = self.lstm(x)
@@ -199,7 +205,24 @@ class LSTMBehaviorModel(pl.LightningModule):
         self.log("val_loss", loss, prog_bar=True)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        
+        # ✅ NOVO: Adiciona o Agendador (Scheduler)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',         # Monitora a redução da perda (minimização)
+            factor=0.5,         # Reduz o LR pela metade
+            patience=3        # Espera 3 épocas sem melhoria no val_loss
+        )
+        
+        # O PyTorch Lightning espera um dicionário para schedulers
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': 'val_loss', # Garante que o val_loss seja monitorado
+            }
+        }
 
 
 # ============================================================
@@ -229,21 +252,23 @@ if __name__ == "__main__":
 
     model = LSTMBehaviorModel(
         input_size=INPUT_SIZE,
-        hidden_size=128, 
-        num_layers=1, 
+        hidden_size=512, 
+        num_layers=5, 
+        dropout_rate = 0.4,
         num_classes=full_dataset.num_classes,
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY
+
     )
 
     trainer = pl.Trainer(
-        max_epochs=10,
+        max_epochs=25,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         log_every_n_steps=10,
         enable_checkpointing=True,
         gradient_clip_val=1.0, 
-        gradient_clip_algorithm="norm" 
+        gradient_clip_algorithm="norm"
     )
 
     print("\n🚀 Iniciando treinamento com Focal Loss (Implementação Manual).")
