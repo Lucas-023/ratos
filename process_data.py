@@ -1,5 +1,3 @@
-# process_data.py - Versão 7.0 (Fixando Colunas Faltantes)
-
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -21,7 +19,7 @@ METADATA_COLUMNS_TO_KEEP_RAW = [
 
 
 def pipeline_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
-    """Aplica o feature engineering completo a um ÚNICO arquivo Parquet."""
+    """Aplica o feature engineering completo a um ÚNICO arquivo Parquet, incluindo novas features."""
     
     if df.empty:
         return pd.DataFrame()
@@ -34,12 +32,10 @@ def pipeline_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     coord_cols_raw = [col for col in df.columns 
                   if (col.endswith('_x') or col.endswith('_y')) and col.startswith('mouse')]
 
-    # 1a. Garante que as colunas críticas são numéricas (Manutenção da Correção de Tipagem)
+    # 1a. Garante que as colunas críticas são numéricas 
     for col in coord_cols_raw:
-        # Converte para float, forçando strings inválidas/malformadas para NaN
         df.loc[:, col] = pd.to_numeric(df[col], errors='coerce').astype(float)
     
-    # Garante que o fator de normalização é numérico para evitar o erro de divisão
     if 'pix_per_cm_approx' in df.columns:
         df.loc[:, 'pix_per_cm_approx'] = pd.to_numeric(df['pix_per_cm_approx'], errors='coerce').astype(float)
     
@@ -52,7 +48,7 @@ def pipeline_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
              lambda x: x.interpolate(method='linear', limit=10, limit_direction='both')
         )
     
-    # 1d. CALCULA O CENTRO DO CORPO (CORREÇÃO ERRO 'Column not found') ❗
+    # 1d. CALCULA O CENTRO DO CORPO
     center_cols_pix = []
     for m in range(1, 5):
         hip_left_x = f'mouse{m}_hip_left_x'
@@ -63,9 +59,7 @@ def pipeline_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
         center_x = f'mouse{m}_body_center_x'
         center_y = f'mouse{m}_body_center_y'
 
-        # Verifica se as colunas de quadril existem para o mouse 'm'
         if hip_left_x in df.columns and hip_right_x in df.columns:
-            # Calcula a média no espaço de pixels e garante que é float
             df.loc[:, center_x] = ((df[hip_left_x] + df[hip_right_x]) / 2.0).astype(float)
             df.loc[:, center_y] = ((df[hip_left_y] + df[hip_right_y]) / 2.0).astype(float)
             center_cols_pix.extend([center_x, center_y])
@@ -77,24 +71,24 @@ def pipeline_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
     df_cm = pd.DataFrame(index=df.index) 
     cm_cols = []
     for col in all_coord_cols_pix:
-        # Renomeia para o padrão de CM
         col_cm = col.replace('_x', '_cm_x').replace('_y', '_cm_y')
+        # Aplica a normalização Pix -> CM
         df_cm.loc[:, col_cm] = (df[col] / df['pix_per_cm_approx']).astype(float) 
         cm_cols.append(col_cm)
 
     # --------------------------------------------------------------------------------
-    # 2. Geração de Features de Velocidade e Distância (USANDO APENAS df_cm) 
+    # 2. Geração de Features de Velocidade, Distância e NOVAS FEATURES
     # --------------------------------------------------------------------------------
     
     df_kinematics = pd.DataFrame(index=df.index) 
     speed_cols = []
     
-    # 2a. Velocidade
+    # 2a. Velocidade (Mantida)
     for m in range(1, 5):
         center_x_cm = f'mouse{m}_body_center_cm_x'
         center_y_cm = f'mouse{m}_body_center_cm_y'
         
-        if center_x_cm in df_cm.columns: # Agora a coluna existe em df_cm!
+        if center_x_cm in df_cm.columns: 
             delta_x = df_cm.groupby(df['video_id'])[center_x_cm].diff() 
             delta_y = df_cm.groupby(df['video_id'])[center_y_cm].diff()
             
@@ -102,7 +96,7 @@ def pipeline_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
             df_kinematics.loc[:, speed_col_name] = np.sqrt(delta_x**2 + delta_y**2)
             speed_cols.append(speed_col_name)
 
-    # 2b. Distância Social
+    # 2b. Distância Social (Mantida)
     mouse_pairs = [(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)]
     dist_cols = []
     for m1, m2 in mouse_pairs:
@@ -119,6 +113,63 @@ def pipeline_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
             )
             dist_cols.append(dist_col_name)
     
+    # --- NOVO: ENGENHARIA DE FEATURES INICIA AQUI ---
+    
+    # 2c. Features de Postura e Ângulo (Orientação corporal)
+    angle_cols = []
+    for m in range(1, 5):
+        tail_x = f'mouse{m}_tail_base_cm_x'
+        tail_y = f'mouse{m}_tail_base_cm_y'
+        nose_x = f'mouse{m}_nose_cm_x'
+        nose_y = f'mouse{m}_nose_cm_y'
+        
+        if tail_x in df_cm.columns and nose_x in df_cm.columns:
+            dx = df_cm[nose_x] - df_cm[tail_x]
+            dy = df_cm[nose_y] - df_cm[tail_y]
+            
+            angle_col_name = f'mouse{m}_body_angle_rad'
+            # np.arctan2 é robusto e retorna o ângulo correto entre -pi e pi
+            df_kinematics.loc[:, angle_col_name] = np.arctan2(dy, dx)
+            angle_cols.append(angle_col_name)
+
+    # 2d. Features de Aceleração (Mudança de Velocidade)
+    accel_cols = []
+    for speed_col in speed_cols: 
+        accel_col_name = speed_col.replace('speed', 'accel') 
+        # A aceleração é a diferença (derivada) da velocidade
+        df_kinematics.loc[:, accel_col_name] = df_kinematics.groupby(df['video_id'])[speed_col].diff()
+        accel_cols.append(accel_col_name)
+
+    # 2e. Features de Distância a Pontos Chave (Nariz <-> Base da Cauda/Genitália)
+    point_dist_cols = []
+    # Cria distâncias Nariz A -> Cauda B e Nariz B -> Cauda A
+    for m1, m2 in mouse_pairs: 
+        nose1_x, nose1_y = f'mouse{m1}_nose_cm_x', f'mouse{m1}_nose_cm_y'
+        tail2_x, tail2_y = f'mouse{m2}_tail_base_cm_x', f'mouse{m2}_tail_base_cm_y'
+
+        nose2_x, nose2_y = f'mouse{m2}_nose_cm_x', f'mouse{m2}_nose_cm_y'
+        tail1_x, tail1_y = f'mouse{m1}_tail_base_cm_x', f'mouse{m1}_tail_base_cm_y'
+        
+        # Distância Nariz M1 -> Base Cauda M2
+        if nose1_x in df_cm.columns and tail2_x in df_cm.columns:
+            dist_col_name_1_2 = f'dist_nose{m1}_tail{m2}_cm'
+            df_kinematics.loc[:, dist_col_name_1_2] = np.sqrt(
+                (df_cm[nose1_x] - df_cm[tail2_x])**2 +
+                (df_cm[nose1_y] - df_cm[tail2_y])**2
+            )
+            point_dist_cols.append(dist_col_name_1_2)
+
+        # Distância Nariz M2 -> Base Cauda M1
+        if nose2_x in df_cm.columns and tail1_x in df_cm.columns:
+            dist_col_name_2_1 = f'dist_nose{m2}_tail{m1}_cm'
+            df_kinematics.loc[:, dist_col_name_2_1] = np.sqrt(
+                (df_cm[nose2_x] - df_cm[tail1_x])**2 +
+                (df_cm[nose2_y] - df_cm[tail1_y])**2
+            )
+            point_dist_cols.append(dist_col_name_2_1)
+            
+    # --- FIM DA ENGENHARIA DE FEATURES ---
+
     # --------------------------------------------------------------------------------
     # 3. Processamento de Metadados (OHE e Normalização)
     # --------------------------------------------------------------------------------
