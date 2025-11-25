@@ -152,6 +152,7 @@ def _aggregate_behaviors(values: pd.Series) -> Any:
 def merge_tracking_and_annotations(
     tracking_df: pd.DataFrame,
     annotation_df: pd.DataFrame,
+    verbose: bool = False,
 ) -> pd.DataFrame:
     """Combina rastreamento com anotações em um único DataFrame."""
     df = tracking_df.copy()
@@ -160,6 +161,8 @@ def merge_tracking_and_annotations(
         df['frame'] = np.arange(len(df), dtype=np.int32)
 
     if annotation_df is None or annotation_df.empty:
+        if verbose:
+            print(f"      ⚠️ DataFrame de anotações vazio ou None")
         if 'behavior' not in df.columns:
             df['behavior'] = None
         return df
@@ -173,17 +176,30 @@ def merge_tracking_and_annotations(
         candidates = [col for col in ann.columns if 'behavior' in col.lower()]
         if candidates:
             behavior_col = candidates[0]
+            if verbose:
+                print(f"      • Usando coluna '{behavior_col}' como behavior")
         else:
+            if verbose:
+                print(f"      ⚠️ Nenhuma coluna 'behavior' encontrada. Colunas disponíveis: {list(ann.columns)}")
             if 'behavior' not in df.columns:
                 df['behavior'] = None
             return df
 
     ann = ann[['frame', behavior_col]].rename(columns={behavior_col: 'behavior'})
+    
+    if verbose:
+        non_empty_before = ann['behavior'].notna().sum()
+        print(f"      • Anotações antes de agrupar: {non_empty_before}/{len(ann)} não vazias")
+    
     ann_grouped = (
         ann.groupby('frame')['behavior']
         .apply(_aggregate_behaviors)
         .reset_index()
     )
+    
+    if verbose:
+        non_empty_after = ann_grouped['behavior'].notna().sum()
+        print(f"      • Anotações após agrupar: {non_empty_after}/{len(ann_grouped)} não vazias")
 
     df = df.merge(ann_grouped, on='frame', how='left', suffixes=('', '_ann'))
 
@@ -253,6 +269,7 @@ def prepare_tracking_dataframe(
     master_annotations_path: Optional[Path],
     metadata_lookup: Dict[int, Dict[str, Any]],
     tracking_root: Path,
+    verbose_diagnostics: bool = False,
 ) -> pd.DataFrame:
     """Carrega o arquivo de tracking e injeta anotações + metadados."""
     try:
@@ -268,6 +285,20 @@ def prepare_tracking_dataframe(
         lab_name = tracking_path.parent.name
 
     sequence_id = tracking_path.stem
+    
+    # Diagnóstico: verifica se arquivos de anotação existem
+    if verbose_diagnostics:
+        print(f"\n🔍 Diagnóstico para {tracking_path.name}:")
+        print(f"   • Lab: {lab_name}")
+        print(f"   • Sequence ID: {sequence_id}")
+        if annotations_root and annotations_root.exists():
+            candidate1 = annotations_root / lab_name / f"{sequence_id}.parquet"
+            candidate2 = annotations_root / f"{sequence_id}.parquet"
+            print(f"   • Candidato 1 existe? {candidate1.exists()}: {candidate1}")
+            print(f"   • Candidato 2 existe? {candidate2.exists()}: {candidate2}")
+        if master_annotations_path and master_annotations_path.exists():
+            print(f"   • Master annotations existe: {master_annotations_path}")
+    
     annotation_df = load_annotation_file(
         sequence_id=sequence_id,
         lab_name=lab_name,
@@ -275,7 +306,28 @@ def prepare_tracking_dataframe(
         master_annotations_path=master_annotations_path,
     )
 
-    df_combined = merge_tracking_and_annotations(df_tracking, annotation_df)
+    # Diagnóstico: verifica se anotações foram carregadas
+    if verbose_diagnostics:
+        if annotation_df.empty:
+            print(f"   ⚠️ Nenhuma anotação encontrada para {sequence_id}")
+        else:
+            print(f"   ✅ Anotações carregadas: {len(annotation_df)} registros")
+            if 'behavior' in annotation_df.columns:
+                non_empty = annotation_df['behavior'].notna().sum()
+                print(f"   • Registros com behavior: {non_empty}/{len(annotation_df)}")
+                if non_empty > 0:
+                    print(f"   • Exemplos: {annotation_df['behavior'].dropna().head(3).tolist()}")
+
+    df_combined = merge_tracking_and_annotations(df_tracking, annotation_df, verbose=verbose_diagnostics)
+    
+    # Diagnóstico final: verifica se behavior foi mesclado
+    if verbose_diagnostics:
+        if 'behavior' in df_combined.columns:
+            non_empty_final = df_combined['behavior'].notna().sum()
+            print(f"   • Após merge: {non_empty_final}/{len(df_combined)} registros com behavior")
+        else:
+            print(f"   ⚠️ Coluna 'behavior' não existe após merge!")
+    
     df_enriched = inject_metadata_columns(
         df=df_combined,
         sequence_id=sequence_id,
@@ -635,6 +687,9 @@ if __name__ == "__main__":
         # ===== PROCESSAMENTO COMPLETO =====
         successful = 0
         failed = 0
+        files_with_labels = 0
+        files_without_labels = 0
+        total_labels_count = 0
         
         for file_path in tqdm(tracking_files, desc="Processando Features para CatBoost"):
             try:
@@ -651,7 +706,22 @@ if __name__ == "__main__":
                     failed += 1
                     continue
 
+                # Verifica se há labels antes de processar
+                if 'behavior' in df_raw.columns:
+                    labels_count = df_raw['behavior'].notna().sum()
+                    if labels_count > 0:
+                        files_with_labels += 1
+                        total_labels_count += labels_count
+                    else:
+                        files_without_labels += 1
+                else:
+                    files_without_labels += 1
+
                 df_processed = pipeline_feature_engineering_catboost(df_raw)
+                
+                # Verifica se behavior foi preservado após processamento
+                if 'behavior' not in df_processed.columns:
+                    tqdm.write(f"⚠️ Coluna 'behavior' perdida após processamento em {file_path.name}")
 
                 relative_path = file_path.relative_to(TRACKING_ROOT)
                 output_file = OUTPUT_PATH / relative_path
@@ -670,7 +740,18 @@ if __name__ == "__main__":
         print("="*60)
         print(f"✅ Arquivos processados com sucesso: {successful}")
         print(f"❌ Arquivos com erro: {failed}")
-        print(f"📁 Dados processados salvos em: {OUTPUT_PATH.resolve()}")
+        print(f"\n📊 ESTATÍSTICAS DE LABELS:")
+        print(f"   • Arquivos com labels: {files_with_labels}")
+        print(f"   • Arquivos sem labels: {files_without_labels}")
+        print(f"   • Total de registros com labels: {total_labels_count:,}")
+        if files_with_labels == 0:
+            print("\n   ⚠️ ATENÇÃO: NENHUM arquivo tem labels!")
+            print("   Possíveis causas:")
+            print("   1. Arquivos de anotação não estão no caminho correto")
+            print("   2. Nomes dos arquivos de anotação não correspondem aos de tracking")
+            print("   3. Arquivos de anotação estão vazios ou sem coluna 'behavior'")
+            print("\n   💡 Execute: python diagnose_annotations.py para diagnóstico detalhado")
+        print(f"\n📁 Dados processados salvos em: {OUTPUT_PATH.resolve()}")
         print("\n💡 Próximos passos:")
         print("   1. Execute: python consolidate_data_catboost.py")
         print("   2. Use as variáveis categóricas diretamente no CatBoost (sem OHE)")
