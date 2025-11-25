@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-from typing import List, Any
+from typing import List, Any, Iterable
 import os
 import pickle
 
@@ -79,8 +79,26 @@ def identify_feature_columns(df_sample: pd.DataFrame) -> tuple:
 
 print("🔍 Identificando estrutura dos dados...")
 
+# -----------------------------------------------------------------
+# Função utilitária para coletar arquivos Parquet (case-insensitive)
+# -----------------------------------------------------------------
+def collect_parquet_files(base_path: Path) -> List[Path]:
+    patterns = ["*.parquet", "*.PARQUET", "*.Parquet"]
+    files = []
+    for pattern in patterns:
+        files.extend(base_path.rglob(pattern))
+    # Remove duplicados preservando ordem
+    seen = set()
+    unique_files = []
+    for f in sorted(files):
+        if f not in seen:
+            unique_files.append(f)
+            seen.add(f)
+    return unique_files
+
+
 # Carrega um arquivo de amostra para identificar colunas
-parquet_files = list(BASE_PATH_TRAIN.rglob("*.parquet"))
+parquet_files = collect_parquet_files(BASE_PATH_TRAIN)
 if not parquet_files:
     print(f"❌ NENHUM arquivo Parquet encontrado em {BASE_PATH_TRAIN.resolve()}.")
     exit()
