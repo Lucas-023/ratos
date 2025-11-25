@@ -249,3 +249,4 @@ print("      cat_features = pd.read_parquet('" + categorical_output + "')")
 print("   2. Use cat_features diretamente no CatBoost (sem OHE)")
 print("   3. CatBoost lidará automaticamente com valores ausentes")
 
+

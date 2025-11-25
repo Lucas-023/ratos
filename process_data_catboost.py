@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -387,4 +387,5 @@ if __name__ == "__main__":
         print("   1. Execute consolidate_data_catboost.py para consolidar os dados")
         print("   2. Use as variáveis categóricas diretamente no CatBoost (sem OHE)")
         print("   3. CatBoost lidará automaticamente com valores ausentes")
+
 

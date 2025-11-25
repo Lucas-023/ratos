@@ -235,3 +235,4 @@ print("   3. Experimente diferentes thresholds para predições binárias")
 print("   4. Use validação cruzada para avaliação mais robusta")
 print("   5. Considere usar CatBoost com MultiLogloss se disponível")
 
+

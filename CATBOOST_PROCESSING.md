@@ -170,3 +170,4 @@ model = CatBoostClassifier(
 - [ ] Performance avaliada
 - [ ] Modelo salvo para inferência
 
+
