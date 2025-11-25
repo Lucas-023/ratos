@@ -545,17 +545,25 @@ def pipeline_feature_engineering_catboost(df: pd.DataFrame) -> pd.DataFrame:
     # --------------------------------------------------------------------------------
     # Mantém variáveis categóricas como categóricas (sem OHE)
     categorical_cols_present = [col for col in CATEGORICAL_COLS if col in df.columns]
-    
-    # Converte para tipo categórico (CatBoost funciona melhor assim)
-    df_context = df[categorical_cols_present + NUMERIC_CONTEXT_COLS].copy()
-    
+    numeric_cols_present = [col for col in NUMERIC_CONTEXT_COLS if col in df.columns]
+    context_cols = categorical_cols_present + numeric_cols_present
+
+    if context_cols:
+        df_context = df[context_cols].copy()
+    else:
+        df_context = pd.DataFrame(index=df.index)
+
+    # Garante que todas as numéricas existam, mesmo que preenchidas com NaN
+    for col in NUMERIC_CONTEXT_COLS:
+        if col not in df_context.columns:
+            df_context[col] = np.nan
+
     for col in categorical_cols_present:
         df_context[col] = df_context[col].astype('category')
-    
+
     # Variáveis numéricas de contexto (sem normalização - CatBoost não precisa)
     for col in NUMERIC_CONTEXT_COLS:
-        if col in df_context.columns:
-            df_context.loc[:, col] = pd.to_numeric(df_context[col], errors='coerce').astype(float)
+        df_context.loc[:, col] = pd.to_numeric(df_context[col], errors='coerce')
     
     # --------------------------------------------------------------------------------
     # 5. Concatenação Final
