@@ -73,28 +73,44 @@ def ensure_multi_hot_cache(
 
     if Y_MULTI_HOT_CACHE.exists() and not rebuild:
         print(f"📂 Reutilizando cache de labels multi-hot: {Y_MULTI_HOT_CACHE}")
-        return np.load(Y_MULTI_HOT_CACHE, mmap_mode="r+")
+        cached = np.load(Y_MULTI_HOT_CACHE, mmap_mode="r+")
+        # Verifica se o cache tem o tamanho correto
+        if cached.shape != (n_samples, n_classes):
+            print(f"   ⚠️ Cache tem tamanho incorreto {cached.shape}, esperado ({n_samples}, {n_classes}). Reconstruindo...")
+            rebuild = True
+        else:
+            return cached
 
-    print("🧱 Construindo cache multi-hot em disco...")
-    y_multi_hot = np.lib.format.open_memmap(
-        Y_MULTI_HOT_CACHE,
-        mode="w+",
-        dtype=np.float32,
-        shape=(n_samples, n_classes),
-    )
-    y_multi_hot[:] = 0.0
+    if rebuild or not Y_MULTI_HOT_CACHE.exists():
+        print("🧱 Construindo cache multi-hot em disco...")
+        y_multi_hot = np.lib.format.open_memmap(
+            Y_MULTI_HOT_CACHE,
+            mode="w+",
+            dtype=np.float32,
+            shape=(n_samples, n_classes),
+        )
+        y_multi_hot[:] = 0.0
 
-    for idx, label_str in enumerate(y_df["behavior"]):
-        for label in parse_multi_label(label_str):
-            if label in label_to_idx:
-                y_multi_hot[idx, label_to_idx[label]] = 1.0
+        labels_processed = 0
+        for idx, label_str in enumerate(y_df["behavior"]):
+            parsed_labels = parse_multi_label(label_str)
+            for label in parsed_labels:
+                if label in label_to_idx:
+                    y_multi_hot[idx, label_to_idx[label]] = 1.0
+                    labels_processed += 1
 
-        if (idx + 1) % 100_000 == 0:
-            print(f"   • Processados {idx+1:,} registros de labels...")
+            if (idx + 1) % 100_000 == 0:
+                print(f"   • Processados {idx+1:,} registros de labels ({labels_processed:,} labels ativos)...")
 
-    y_multi_hot.flush()
-    print(f"✅ Cache de labels salvo em {Y_MULTI_HOT_CACHE}")
-    return y_multi_hot
+        y_multi_hot.flush()
+        print(f"✅ Cache de labels salvo em {Y_MULTI_HOT_CACHE}")
+        print(f"   • Total de labels processados: {labels_processed:,}")
+        
+        # Verificação final
+        total_check = np.asarray(y_multi_hot).sum()
+        print(f"   • Verificação: {int(total_check):,} labels ativos na matriz")
+        
+    return np.load(Y_MULTI_HOT_CACHE, mmap_mode="r+")
 
 
 def _build_cat_value_maps(categorical_info: dict) -> dict[str, dict[str, int]]:
@@ -186,13 +202,42 @@ def train_models(
     n_classes = y_train.shape[1]
     models: list[CatBoostClassifier | None] = []
 
+    # Diagnóstico: verifica quantas classes têm exemplos positivos
+    print("\n🔍 Diagnóstico de classes...")
+    classes_with_samples = []
+    for class_idx in range(n_classes):
+        y_class = np.asarray(y_train[:, class_idx])
+        positive_count = int(y_class.sum())
+        if positive_count > 0:
+            classes_with_samples.append((class_idx, positive_count, all_labels[class_idx]))
+    
+    print(f"   • Total de classes: {n_classes}")
+    print(f"   • Classes com exemplos positivos: {len(classes_with_samples)}")
+    if len(classes_with_samples) == 0:
+        print("   ⚠️ NENHUMA classe tem exemplos positivos! Verifique a construção da matriz multi-hot.")
+        return models
+    
+    if len(classes_with_samples) <= 10:
+        print("   • Classes ativas:")
+        for idx, count, label in classes_with_samples:
+            print(f"      - [{idx}] {label}: {count:,} exemplos")
+    else:
+        print(f"   • Primeiras 5 classes ativas:")
+        for idx, count, label in classes_with_samples[:5]:
+            print(f"      - [{idx}] {label}: {count:,} exemplos")
+        print(f"   • ... e mais {len(classes_with_samples) - 5} classes")
+
     print("\n🚀 Iniciando treinamento One-vs-Rest...")
     for class_idx in range(n_classes):
         if class_idx % 10 == 0:
-            print(f"   → Classe {class_idx + 1}/{n_classes}")
+            print(f"   → Classe {class_idx + 1}/{n_classes} ({all_labels[class_idx]})")
 
-        y_class = y_train[:, class_idx]
-        if y_class.sum() == 0:
+        # Converte para array numpy para garantir operações corretas
+        y_class_train = np.asarray(y_train[:, class_idx], dtype=np.float32)
+        y_class_val = np.asarray(y_val[:, class_idx], dtype=np.float32)
+        
+        positive_count = int(y_class_train.sum())
+        if positive_count == 0:
             models.append(None)
             continue
 
@@ -208,31 +253,52 @@ def train_models(
             task_type="CPU",
         )
 
+        # Converte X para array se for memmap (CatBoost pode ter problemas com memmaps)
+        X_train_array = np.asarray(X_train) if isinstance(X_train, np.memmap) else X_train
+        X_val_array = np.asarray(X_val) if isinstance(X_val, np.memmap) else X_val
+
         model.fit(
-            X_train,
-            y_class,
-            eval_set=(X_val, y_val[:, class_idx]),
+            X_train_array,
+            y_class_train,
+            eval_set=(X_val_array, y_class_val),
             early_stopping_rounds=50,
             verbose=False,
         )
         models.append(model)
 
-    print(f"✅ {sum(m is not None for m in models)} modelos treinados")
+    trained_count = sum(m is not None for m in models)
+    print(f"✅ {trained_count} modelos treinados de {n_classes} classes")
     return models
 
 
 def evaluate(models: list[CatBoostClassifier | None], X_val: np.ndarray, y_val: np.ndarray):
     """Calcula métricas multi-label."""
+    if not any(m is not None for m in models):
+        print("\n⚠️ Nenhum modelo foi treinado. Pulando avaliação.")
+        return
+    
     n_classes = y_val.shape[1]
     y_pred_proba = np.zeros((X_val.shape[0], n_classes), dtype=np.float32)
 
+    # Converte X_val para array se for memmap
+    X_val_array = np.asarray(X_val) if isinstance(X_val, np.memmap) else X_val
+    
     for class_idx, model in enumerate(models):
         if model is not None:
-            y_pred_proba[:, class_idx] = model.predict_proba(X_val)[:, 1]
+            y_pred_proba[:, class_idx] = model.predict_proba(X_val_array)[:, 1]
 
-    y_pred = (y_pred_proba >= 0.5).astype(int)
-    hamming = hamming_loss(y_val, y_pred)
-    subset_accuracy = accuracy_score(y_val, y_pred)
+    # Converte y_val para array numpy (sklearn precisa de array, não memmap)
+    y_val_array = np.asarray(y_val, dtype=np.int32)
+    y_pred = (y_pred_proba >= 0.5).astype(np.int32)
+    
+    # Garante que são arrays 2D com formato correto
+    if y_val_array.ndim == 1:
+        y_val_array = y_val_array.reshape(-1, 1)
+    if y_pred.ndim == 1:
+        y_pred = y_pred.reshape(-1, 1)
+    
+    hamming = hamming_loss(y_val_array, y_pred)
+    subset_accuracy = accuracy_score(y_val_array, y_pred)
 
     print("\n📊 Avaliação:")
     print(f"   • Hamming Loss: {hamming:.4f} (menor é melhor)")
@@ -240,15 +306,21 @@ def evaluate(models: list[CatBoostClassifier | None], X_val: np.ndarray, y_val: 
 
 
 def save_models(models: list[CatBoostClassifier | None], all_labels: list[str], label_to_idx: dict[str, int], cat_feature_indices: list[int]):
+    if not any(m is not None for m in models):
+        print("\n⚠️ Nenhum modelo para salvar.")
+        return
+    
     model_dir = Path("catboost_models")
     model_dir.mkdir(exist_ok=True)
 
+    saved_count = 0
     for class_idx, model in enumerate(models):
         if model is None:
             continue
-        safe_label = all_labels[class_idx].replace(" ", "_")
+        safe_label = all_labels[class_idx].replace(" ", "_").replace("/", "_")
         model_path = model_dir / f"catboost_class_{class_idx}_{safe_label}.cbm"
         model.save_model(str(model_path))
+        saved_count += 1
 
     label_info = {
         "all_labels": all_labels,
@@ -259,7 +331,7 @@ def save_models(models: list[CatBoostClassifier | None], all_labels: list[str], 
     with open(model_dir / "label_info.pkl", "wb") as f:
         pickle.dump(label_info, f)
 
-    print(f"💾 Modelos e metadados salvos em {model_dir.resolve()}")
+    print(f"💾 {saved_count} modelos e metadados salvos em {model_dir.resolve()}")
 
 
 # =================================================================
@@ -288,6 +360,18 @@ def main():
     y_multi_hot = ensure_multi_hot_cache(y_df, label_to_idx, rebuild=args.rebuild_cache)
     X_combined, cat_feature_indices = ensure_feature_cache(args.rebuild_cache, categorical_info)
 
+    # Diagnóstico da matriz multi-hot
+    print("\n🔍 Verificando matriz multi-hot...")
+    y_multi_hot_array = np.asarray(y_multi_hot)
+    total_positives = y_multi_hot_array.sum()
+    samples_with_labels = (y_multi_hot_array.sum(axis=1) > 0).sum()
+    print(f"   • Total de labels ativos: {int(total_positives):,}")
+    print(f"   • Amostras com pelo menos 1 label: {samples_with_labels:,} de {len(y_multi_hot_array):,}")
+    print(f"   • Média de labels por amostra: {total_positives / len(y_multi_hot_array):.2f}")
+    
+    if total_positives == 0:
+        raise ValueError("❌ A matriz multi-hot está vazia! Nenhum label foi encontrado. Verifique o arquivo de labels.")
+
     total_samples = X_combined.shape[0]
     split_idx = int((1.0 - args.val_split) * total_samples)
     if split_idx == 0 or split_idx == total_samples:
@@ -299,8 +383,8 @@ def main():
     y_val = y_multi_hot[split_idx:]
 
     print(f"\n📊 Divisão dos dados (sem cópia):")
-    print(f"   • Treino: {X_train.shape[0]} amostras")
-    print(f"   • Validação: {X_val.shape[0]} amostras")
+    print(f"   • Treino: {X_train.shape[0]:,} amostras")
+    print(f"   • Validação: {X_val.shape[0]:,} amostras")
 
     models = train_models(
         X_train,
