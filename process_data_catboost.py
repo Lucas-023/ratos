@@ -55,6 +55,238 @@ def safe_interpolate(series: pd.Series, limit: int = 10) -> pd.Series:
     return series.interpolate(method='linear', limit=limit, limit_direction='both')
 
 
+def load_sequence_metadata(metadata_path: Path) -> pd.DataFrame:
+    """Carrega o arquivo sequence_metadata.csv se existir."""
+    if not metadata_path or not metadata_path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(metadata_path)
+    except Exception as exc:
+        print(f"⚠️ Não foi possível carregar {metadata_path}: {exc}")
+        return pd.DataFrame()
+
+
+def build_metadata_lookup(metadata_df: pd.DataFrame) -> Dict[int, Dict[str, Any]]:
+    """Cria um mapa sequence_id -> metadados."""
+    if metadata_df.empty or 'sequence_id' not in metadata_df.columns:
+        return {}
+
+    metadata_df = metadata_df.set_index('sequence_id')
+    lookup: Dict[int, Dict[str, Any]] = {}
+    for seq_id, row in metadata_df.iterrows():
+        try:
+            lookup[int(seq_id)] = row.to_dict()
+        except (ValueError, TypeError):
+            continue
+    return lookup
+
+
+def load_annotation_file(
+    sequence_id: str,
+    lab_name: str,
+    annotations_root: Optional[Path],
+    master_annotations_path: Optional[Path],
+) -> pd.DataFrame:
+    """Carrega o arquivo de anotações correspondente ao sequence_id."""
+    candidate_files: List[Path] = []
+
+    if annotations_root and annotations_root.exists():
+        candidate_files.append(annotations_root / lab_name / f"{sequence_id}.parquet")
+        candidate_files.append(annotations_root / f"{sequence_id}.parquet")
+
+    for candidate in candidate_files:
+        if candidate.exists():
+            try:
+                return pd.read_parquet(candidate, engine='fastparquet')
+            except Exception as exc:
+                print(f"⚠️ Falha ao ler {candidate}: {exc}")
+
+    if master_annotations_path and master_annotations_path.exists():
+        try:
+            seq_int = int(sequence_id)
+        except ValueError:
+            seq_int = sequence_id
+        try:
+            df_master = pd.read_parquet(
+                master_annotations_path,
+                engine='pyarrow',
+                filters=[('sequence_id', '==', seq_int)],
+            )
+            if 'sequence_id' in df_master.columns:
+                df_master = df_master.drop(columns=['sequence_id'])
+            return df_master
+        except Exception as exc:
+            print(f"⚠️ Falha ao filtrar {master_annotations_path.name} para {sequence_id}: {exc}")
+
+    return pd.DataFrame()
+
+
+def _aggregate_behaviors(values: pd.Series) -> Any:
+    """Agrupa múltiplos comportamentos no mesmo frame."""
+    behaviors: List[str] = []
+    for value in values:
+        if isinstance(value, list):
+            behaviors.extend([str(v).strip() for v in value if str(v).strip()])
+        elif isinstance(value, (tuple, set)):
+            behaviors.extend([str(v).strip() for v in value if str(v).strip()])
+        elif pd.isna(value):
+            continue
+        else:
+            str_val = str(value).strip()
+            if not str_val:
+                continue
+            if ';' in str_val:
+                behaviors.extend([v.strip() for v in str_val.split(';') if v.strip()])
+            else:
+                behaviors.append(str_val)
+
+    if not behaviors:
+        return np.nan
+
+    unique_vals = sorted(set(behaviors))
+    if len(unique_vals) == 1:
+        return unique_vals[0]
+    return unique_vals
+
+
+def merge_tracking_and_annotations(
+    tracking_df: pd.DataFrame,
+    annotation_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Combina rastreamento com anotações em um único DataFrame."""
+    df = tracking_df.copy()
+
+    if 'frame' not in df.columns:
+        df['frame'] = np.arange(len(df), dtype=np.int32)
+
+    if annotation_df is None or annotation_df.empty:
+        if 'behavior' not in df.columns:
+            df['behavior'] = None
+        return df
+
+    ann = annotation_df.copy()
+    if 'frame' not in ann.columns:
+        ann['frame'] = np.arange(len(ann), dtype=np.int32)
+
+    behavior_col = 'behavior'
+    if behavior_col not in ann.columns:
+        candidates = [col for col in ann.columns if 'behavior' in col.lower()]
+        if candidates:
+            behavior_col = candidates[0]
+        else:
+            if 'behavior' not in df.columns:
+                df['behavior'] = None
+            return df
+
+    ann = ann[['frame', behavior_col]].rename(columns={behavior_col: 'behavior'})
+    ann_grouped = (
+        ann.groupby('frame')['behavior']
+        .apply(_aggregate_behaviors)
+        .reset_index()
+    )
+
+    df = df.merge(ann_grouped, on='frame', how='left', suffixes=('', '_ann'))
+
+    if 'behavior_ann' in df.columns:
+        if 'behavior' in df.columns:
+            df['behavior'] = df['behavior_ann'].combine_first(df['behavior'])
+        else:
+            df['behavior'] = df['behavior_ann']
+        df.drop(columns=['behavior_ann'], inplace=True)
+
+    if 'behavior' not in df.columns:
+        df['behavior'] = None
+
+    return df
+
+
+def inject_metadata_columns(
+    df: pd.DataFrame,
+    sequence_id: str,
+    lab_name: str,
+    metadata_lookup: Dict[int, Dict[str, Any]],
+) -> pd.DataFrame:
+    """Adiciona colunas de metadados usando sequence_metadata.csv."""
+    df = df.copy()
+
+    try:
+        seq_int = int(sequence_id)
+    except (ValueError, TypeError):
+        seq_int = None
+
+    metadata_values = metadata_lookup.get(seq_int, {}) if seq_int is not None else {}
+
+    df['lab_id'] = df.get('lab_id', lab_name)
+    df['video_id'] = df.get('video_id', f"{lab_name}_{sequence_id}")
+
+    for col, value in metadata_values.items():
+        if col in df.columns:
+            continue
+        df[col] = value
+
+    defaults = {
+        'pix_per_cm_approx': 1.0,
+        'frames_per_second': 30.0,
+        'video_width_pix': np.nan,
+        'video_height_pix': np.nan,
+    }
+    for col, default_value in defaults.items():
+        if col not in df.columns:
+            df[col] = default_value
+
+    if 'video_duration_sec' not in df.columns:
+        fps = pd.to_numeric(df['frames_per_second'], errors='coerce').fillna(30.0)
+        if not df.empty:
+            df['video_duration_sec'] = df['frame'].max() / max(fps.iloc[0], 1.0)
+        else:
+            df['video_duration_sec'] = np.nan
+
+    if 'unique_frame_id' not in df.columns:
+        df['unique_frame_id'] = df['video_id'].astype(str) + "_" + df['frame'].astype(str)
+
+    return df
+
+
+def prepare_tracking_dataframe(
+    tracking_path: Path,
+    annotations_root: Optional[Path],
+    master_annotations_path: Optional[Path],
+    metadata_lookup: Dict[int, Dict[str, Any]],
+    tracking_root: Path,
+) -> pd.DataFrame:
+    """Carrega o arquivo de tracking e injeta anotações + metadados."""
+    try:
+        df_tracking = pd.read_parquet(tracking_path, engine='fastparquet')
+    except Exception as exc:
+        print(f"⚠️ Falha ao ler {tracking_path.name}: {exc}")
+        return pd.DataFrame()
+
+    try:
+        relative_parts = tracking_path.relative_to(tracking_root).parts
+        lab_name = relative_parts[0]
+    except ValueError:
+        lab_name = tracking_path.parent.name
+
+    sequence_id = tracking_path.stem
+    annotation_df = load_annotation_file(
+        sequence_id=sequence_id,
+        lab_name=lab_name,
+        annotations_root=annotations_root,
+        master_annotations_path=master_annotations_path,
+    )
+
+    df_combined = merge_tracking_and_annotations(df_tracking, annotation_df)
+    df_enriched = inject_metadata_columns(
+        df=df_combined,
+        sequence_id=sequence_id,
+        lab_name=lab_name,
+        metadata_lookup=metadata_lookup,
+    )
+    return df_enriched
+
+
+
+
 def add_temporal_features(df: pd.DataFrame, group_col: str = 'video_id') -> pd.DataFrame:
     """
     Adiciona features temporais essenciais para modelos de árvore:
@@ -349,43 +581,63 @@ def pipeline_feature_engineering_catboost(df: pd.DataFrame) -> pd.DataFrame:
 # =================================================================
 
 if __name__ == "__main__":
-    # Caminhos de entrada e saída
-    INPUT_PATH = Path("MABe-mouse-behavior-detection/processed_videos_final_fixed")
+    TRACKING_ROOT = Path("MABe-mouse-behavior-detection/train_tracking")
+    ANNOTATIONS_ROOT = Path("MABe-mouse-behavior-detection/train_annotation")
+    MASTER_ANNOTATIONS_PATH = Path("MABe-mouse-behavior-detection/train_annotations.parquet")
+    SEQUENCE_METADATA_PATH = Path("MABe-mouse-behavior-detection/sequence_metadata.csv")
     OUTPUT_PATH = Path("MABe-mouse-behavior-detection/feature_engineered_data_catboost")
-    
-    OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
-    
-    parquet_files = list(INPUT_PATH.rglob("*.parquet"))
 
-    if not parquet_files:
-        print(f"❌ NENHUM arquivo Parquet encontrado na pasta de entrada: {INPUT_PATH.absolute()}")
+    metadata_df = load_sequence_metadata(SEQUENCE_METADATA_PATH)
+    metadata_lookup = build_metadata_lookup(metadata_df)
+
+    OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+
+    if not TRACKING_ROOT.exists():
+        raise FileNotFoundError(
+            f"Pasta de tracking não encontrada: {TRACKING_ROOT}. "
+            "Verifique se o dataset do Kaggle está no caminho correto."
+        )
+
+    tracking_files = list(TRACKING_ROOT.rglob("*.parquet"))
+
+    if not tracking_files:
+        print(f"❌ Nenhum arquivo de tracking encontrado em {TRACKING_ROOT.resolve()}")
     else:
-        print(f"🔍 Encontrados {len(parquet_files)} arquivos para processar.")
-        print("🚀 Iniciando processamento otimizado para CatBoost...")
-        
-        for file_path in tqdm(parquet_files, desc="Processando Features para CatBoost"):
+        print(f"🔍 Encontrados {len(tracking_files)} arquivos de tracking.")
+        print("🚀 Preparando dados diretamente de train_tracking/train_annotation ...")
+
+        for file_path in tqdm(tracking_files, desc="Processando Features para CatBoost"):
             try:
-                # Carrega
-                df_raw = pd.read_parquet(file_path, engine='fastparquet')
-                
-                # Processa
+                df_raw = prepare_tracking_dataframe(
+                    tracking_path=file_path,
+                    annotations_root=ANNOTATIONS_ROOT,
+                    master_annotations_path=MASTER_ANNOTATIONS_PATH,
+                    metadata_lookup=metadata_lookup,
+                    tracking_root=TRACKING_ROOT,
+                )
+
+                if df_raw.empty:
+                    tqdm.write(f"⚠️ Dados vazios em {file_path.name}. Pulando.")
+                    continue
+
                 df_processed = pipeline_feature_engineering_catboost(df_raw)
-                
-                # Salva
-                output_file = OUTPUT_PATH / file_path.name
+
+                relative_path = file_path.relative_to(TRACKING_ROOT)
+                output_file = OUTPUT_PATH / relative_path
+                output_file.parent.mkdir(parents=True, exist_ok=True)
                 df_processed.to_parquet(output_file, engine='fastparquet', index=False)
-                
+
             except Exception as e:
-                print(f"\n⚠️ ERRO FATAL ao processar {file_path.name}: {e}. Pulando.")
+                print(f"\n⚠️ ERRO ao processar {file_path}: {e}. Pulando.")
                 import traceback
                 traceback.print_exc()
                 continue
 
         print("\n✅ Processamento de Features para CatBoost concluído.")
-        print(f"📁 Dados processados salvos em: {OUTPUT_PATH}")
+        print(f"📁 Dados processados salvos em: {OUTPUT_PATH.resolve()}")
         print("\n💡 Próximos passos:")
         print("   1. Execute consolidate_data_catboost.py para consolidar os dados")
         print("   2. Use as variáveis categóricas diretamente no CatBoost (sem OHE)")
-        print("   3. CatBoost lidará automaticamente com valores ausentes")
+        print("   3. CatBoost lida automaticamente com valores ausentes")
 
 

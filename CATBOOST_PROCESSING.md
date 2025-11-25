@@ -39,6 +39,9 @@ python process_data_catboost.py
 ```
 
 Este script:
+- Lê automaticamente `MABe-mouse-behavior-detection/train_tracking/**.parquet`
+- Encontra as anotações correspondentes em `train_annotation/` (ou `train_annotations.parquet`)
+- Injeta metadados de `sequence_metadata.csv` quando disponível
 - Processa arquivos Parquet raw
 - Adiciona features temporais
 - Mantém variáveis categóricas como categóricas
