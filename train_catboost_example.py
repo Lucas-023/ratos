@@ -13,6 +13,7 @@ Fluxo:
 import argparse
 import warnings
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -44,21 +45,64 @@ CHUNK_ROWS = 50_000
 # FUNÇÕES AUXILIARES
 # =================================================================
 
-def parse_multi_label(label_str: str) -> list[str]:
+def parse_multi_label(label_str: str | Any) -> list[str]:
     """Converte string (com ';') em lista de labels."""
-    if pd.isna(label_str) or label_str == "":
+    # Trata valores NaN/None
+    if pd.isna(label_str) or label_str is None:
         return []
-    return [lbl.strip() for lbl in str(label_str).split(";") if lbl.strip()]
+    
+    # Converte para string
+    label_str = str(label_str)
+    
+    # Trata strings vazias
+    if label_str.strip() == "" or label_str.lower() in ("nan", "none", "null"):
+        return []
+    
+    # Se já é uma lista (pode acontecer se o CSV foi lido incorretamente)
+    if isinstance(label_str, (list, tuple)):
+        return [str(l).strip() for l in label_str if str(l).strip() and str(l).lower() not in ("nan", "none", "null")]
+    
+    # Divide por ';' e limpa
+    labels = [lbl.strip() for lbl in label_str.split(";") if lbl.strip() and lbl.lower() not in ("nan", "none", "null")]
+    return labels
 
 
 def load_label_space(y_df: pd.DataFrame) -> tuple[list[str], dict[str, int]]:
     """Cria lista ordenada de labels e mapa label->indice."""
     all_labels = set()
-    for label_str in y_df["behavior"]:
-        all_labels.update(parse_multi_label(label_str))
+    total_rows = len(y_df)
+    non_empty_count = 0
+    
+    print(f"   🔍 Analisando {total_rows:,} registros de labels...")
+    
+    for idx, label_str in enumerate(y_df["behavior"]):
+        parsed = parse_multi_label(label_str)
+        if parsed:
+            non_empty_count += 1
+            all_labels.update(parsed)
+        
+        # Mostra exemplos dos primeiros registros
+        if idx < 5:
+            print(f"      Exemplo {idx+1}: tipo={type(label_str)}, valor={repr(label_str)[:100]}")
+            print(f"         → Parseado: {parsed}")
 
+    print(f"   • Registros com labels não vazios: {non_empty_count:,} de {total_rows:,}")
+    print(f"   • Labels únicos encontrados: {len(all_labels)}")
+    
+    if len(all_labels) == 0:
+        print("   ⚠️ NENHUM label encontrado! Verificando tipos de dados...")
+        # Diagnóstico adicional
+        sample_values = y_df["behavior"].head(20).tolist()
+        print(f"   • Primeiros 20 valores brutos:")
+        for i, val in enumerate(sample_values):
+            print(f"      [{i}] tipo={type(val)}, valor={repr(val)[:150]}")
+    
     ordered_labels = sorted(all_labels)
     label_to_idx = {label: idx for idx, label in enumerate(ordered_labels)}
+    
+    if len(ordered_labels) > 0:
+        print(f"   • Primeiros 10 labels: {ordered_labels[:10]}")
+    
     return ordered_labels, label_to_idx
 
 
@@ -92,15 +136,33 @@ def ensure_multi_hot_cache(
         y_multi_hot[:] = 0.0
 
         labels_processed = 0
+        labels_not_found = set()
+        labels_found = set()
+        
         for idx, label_str in enumerate(y_df["behavior"]):
             parsed_labels = parse_multi_label(label_str)
             for label in parsed_labels:
                 if label in label_to_idx:
                     y_multi_hot[idx, label_to_idx[label]] = 1.0
                     labels_processed += 1
+                    labels_found.add(label)
+                else:
+                    labels_not_found.add(label)
+                    # Mostra os primeiros labels não encontrados para diagnóstico
+                    if len(labels_not_found) <= 10:
+                        print(f"      ⚠️ Label não encontrado no mapeamento: {repr(label)}")
 
             if (idx + 1) % 100_000 == 0:
                 print(f"   • Processados {idx+1:,} registros de labels ({labels_processed:,} labels ativos)...")
+        
+        # Diagnóstico final
+        print(f"\n   📊 Diagnóstico da construção:")
+        print(f"      • Labels encontrados no mapeamento: {len(labels_found)}")
+        print(f"      • Labels NÃO encontrados: {len(labels_not_found)}")
+        if labels_not_found:
+            print(f"      • Primeiros labels não encontrados: {list(labels_not_found)[:10]}")
+        if labels_found:
+            print(f"      • Primeiros labels encontrados: {list(labels_found)[:10]}")
 
         y_multi_hot.flush()
         print(f"✅ Cache de labels salvo em {Y_MULTI_HOT_CACHE}")
@@ -109,6 +171,13 @@ def ensure_multi_hot_cache(
         # Verificação final
         total_check = np.asarray(y_multi_hot).sum()
         print(f"   • Verificação: {int(total_check):,} labels ativos na matriz")
+        
+        if total_check == 0:
+            print("\n   ⚠️ ATENÇÃO: Matriz multi-hot está vazia!")
+            print("   Possíveis causas:")
+            print("   1. Labels no CSV não correspondem aos labels no label_to_idx")
+            print("   2. Formato dos labels no CSV está incorreto")
+            print("   3. Problema na função parse_multi_label")
         
     return np.load(Y_MULTI_HOT_CACHE, mmap_mode="r+")
 
@@ -348,8 +417,41 @@ def main():
     args = parser.parse_args()
 
     print("📂 Carregando labels...")
+    
+    # Diagnóstico: verifica o arquivo antes de carregar
+    print(f"   • Arquivo: {Y_PATH}")
+    if not Y_PATH.exists():
+        raise FileNotFoundError(f"Arquivo de labels não encontrado: {Y_PATH}")
+    
+    # Lê algumas linhas para diagnóstico
+    with open(Y_PATH, 'r', encoding='utf-8') as f:
+        first_lines = [f.readline().strip() for _ in range(5)]
+    print(f"   • Primeiras 5 linhas do arquivo:")
+    for i, line in enumerate(first_lines):
+        print(f"      [{i}] {repr(line)[:150]}")
+    
+    # Carrega o CSV
     y_df = pd.read_csv(Y_PATH)
     print(f"✅ Labels carregados: {len(y_df)} amostras")
+    print(f"   • Colunas no DataFrame: {list(y_df.columns)}")
+    
+    # Verifica se a coluna 'behavior' existe
+    if 'behavior' not in y_df.columns:
+        print(f"   ⚠️ Coluna 'behavior' não encontrada!")
+        print(f"   • Colunas disponíveis: {list(y_df.columns)}")
+        # Tenta usar a primeira coluna
+        if len(y_df.columns) > 0:
+            first_col = y_df.columns[0]
+            print(f"   • Usando primeira coluna: '{first_col}'")
+            y_df = y_df.rename(columns={first_col: 'behavior'})
+        else:
+            raise ValueError("DataFrame de labels está vazio!")
+    
+    # Mostra estatísticas dos labels
+    non_empty = y_df['behavior'].notna().sum()
+    empty = y_df['behavior'].isna().sum()
+    print(f"   • Registros não vazios: {non_empty:,}")
+    print(f"   • Registros vazios/NaN: {empty:,}")
 
     all_labels, label_to_idx = load_label_space(y_df)
     print(f"✅ {len(all_labels)} comportamentos únicos")
