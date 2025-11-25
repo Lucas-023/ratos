@@ -563,10 +563,11 @@ def pipeline_feature_engineering_catboost(df: pd.DataFrame) -> pd.DataFrame:
 
     # Variáveis numéricas de contexto (sem normalização - CatBoost não precisa)
     for col in NUMERIC_CONTEXT_COLS:
-        df_context.loc[:, col] = pd.to_numeric(df_context[col], errors='coerce')
+        if col in df_context.columns:
+            df_context.loc[:, col] = pd.to_numeric(df_context[col], errors='coerce')
     
     # --------------------------------------------------------------------------------
-    # 5. Concatenação Final
+    # 5. Concatenação Final (CORRIGIDO - Remove duplicatas)
     # --------------------------------------------------------------------------------
     base_cols = list(set(METADATA_COLUMNS_TO_KEEP_RAW) & set(df.columns))
     df_final = df[base_cols].copy()
@@ -575,11 +576,18 @@ def pipeline_feature_engineering_catboost(df: pd.DataFrame) -> pd.DataFrame:
     temp_numeric_cols = [col for col in df_temp.columns 
                         if col not in ['video_id', 'frame'] and df_temp[col].dtype in [np.float32, np.float64, np.int32, np.int64]]
     
+    # Remove de df_context as colunas que já existem em df_final
+    context_cols_to_add = [col for col in df_context.columns if col not in df_final.columns]
+    df_context_filtered = df_context[context_cols_to_add] if context_cols_to_add else pd.DataFrame(index=df_context.index)
+    
     df_final = pd.concat([
         df_final,
         df_temp[temp_numeric_cols],
-        df_context
+        df_context_filtered  # Usa apenas colunas não duplicadas
     ], axis=1)
+    
+    # Segurança adicional: Remove quaisquer duplicatas que possam ter passado
+    df_final = df_final.loc[:, ~df_final.columns.duplicated()]
     
     return df_final.reset_index(drop=True)
 
@@ -595,8 +603,17 @@ if __name__ == "__main__":
     SEQUENCE_METADATA_PATH = Path("MABe-mouse-behavior-detection/sequence_metadata.csv")
     OUTPUT_PATH = Path("MABe-mouse-behavior-detection/feature_engineered_data_catboost")
 
+    # ===== DIAGNÓSTICO INICIAL =====
+    print("🔍 DIAGNÓSTICO INICIAL:")
+    print(f"   TRACKING_ROOT existe? {TRACKING_ROOT.exists()}")
+    print(f"   ANNOTATIONS_ROOT existe? {ANNOTATIONS_ROOT.exists()}")
+    print(f"   MASTER_ANNOTATIONS existe? {MASTER_ANNOTATIONS_PATH.exists()}")
+    print(f"   SEQUENCE_METADATA existe? {SEQUENCE_METADATA_PATH.exists()}")
+    print()
+
     metadata_df = load_sequence_metadata(SEQUENCE_METADATA_PATH)
     metadata_lookup = build_metadata_lookup(metadata_df)
+    print(f"✅ Metadados carregados: {len(metadata_lookup)} sequências")
 
     OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -612,8 +629,13 @@ if __name__ == "__main__":
         print(f"❌ Nenhum arquivo de tracking encontrado em {TRACKING_ROOT.resolve()}")
     else:
         print(f"🔍 Encontrados {len(tracking_files)} arquivos de tracking.")
-        print("🚀 Preparando dados diretamente de train_tracking/train_annotation ...")
+        print(f"   Exemplo: {tracking_files[0]}")
+        print("🚀 Preparando dados diretamente de train_tracking/train_annotation ...\n")
 
+        # ===== PROCESSAMENTO COMPLETO =====
+        successful = 0
+        failed = 0
+        
         for file_path in tqdm(tracking_files, desc="Processando Features para CatBoost"):
             try:
                 df_raw = prepare_tracking_dataframe(
@@ -626,6 +648,7 @@ if __name__ == "__main__":
 
                 if df_raw.empty:
                     tqdm.write(f"⚠️ Dados vazios em {file_path.name}. Pulando.")
+                    failed += 1
                     continue
 
                 df_processed = pipeline_feature_engineering_catboost(df_raw)
@@ -634,18 +657,21 @@ if __name__ == "__main__":
                 output_file = OUTPUT_PATH / relative_path
                 output_file.parent.mkdir(parents=True, exist_ok=True)
                 df_processed.to_parquet(output_file, engine='fastparquet', index=False)
+                
+                successful += 1
 
             except Exception as e:
-                print(f"\n⚠️ ERRO ao processar {file_path}: {e}. Pulando.")
-                import traceback
-                traceback.print_exc()
+                tqdm.write(f"\n⚠️ ERRO ao processar {file_path.name}: {e}")
+                failed += 1
                 continue
 
-        print("\n✅ Processamento de Features para CatBoost concluído.")
+        print("\n" + "="*60)
+        print("✅ PROCESSAMENTO CONCLUÍDO")
+        print("="*60)
+        print(f"✅ Arquivos processados com sucesso: {successful}")
+        print(f"❌ Arquivos com erro: {failed}")
         print(f"📁 Dados processados salvos em: {OUTPUT_PATH.resolve()}")
         print("\n💡 Próximos passos:")
-        print("   1. Execute consolidate_data_catboost.py para consolidar os dados")
+        print("   1. Execute: python consolidate_data_catboost.py")
         print("   2. Use as variáveis categóricas diretamente no CatBoost (sem OHE)")
-        print("   3. CatBoost lida automaticamente com valores ausentes")
-
-
+        print("   3. CatBoost lidará automaticamente com valores ausentes")
