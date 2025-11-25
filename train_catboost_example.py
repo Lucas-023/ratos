@@ -54,16 +54,21 @@ def parse_multi_label(label_str: str | Any) -> list[str]:
     # Converte para string
     label_str = str(label_str)
     
-    # Trata strings vazias
-    if label_str.strip() == "" or label_str.lower() in ("nan", "none", "null"):
+    # Remove aspas duplas se presentes (pode acontecer ao ler CSV)
+    if label_str.startswith('"') and label_str.endswith('"'):
+        label_str = label_str[1:-1]
+    
+    # Trata strings vazias (incluindo "" com aspas)
+    if label_str.strip() == "" or label_str.strip() == '""' or label_str.lower() in ("nan", "none", "null", '""'):
         return []
     
     # Se já é uma lista (pode acontecer se o CSV foi lido incorretamente)
     if isinstance(label_str, (list, tuple)):
-        return [str(l).strip() for l in label_str if str(l).strip() and str(l).lower() not in ("nan", "none", "null")]
+        return [str(l).strip() for l in label_str if str(l).strip() and str(l).lower() not in ("nan", "none", "null", '""')]
     
     # Divide por ';' e limpa
-    labels = [lbl.strip() for lbl in label_str.split(";") if lbl.strip() and lbl.lower() not in ("nan", "none", "null")]
+    labels = [lbl.strip() for lbl in label_str.split(";") 
+              if lbl.strip() and lbl.strip() != '""' and lbl.lower() not in ("nan", "none", "null")]
     return labels
 
 
@@ -430,8 +435,8 @@ def main():
     for i, line in enumerate(first_lines):
         print(f"      [{i}] {repr(line)[:150]}")
     
-    # Carrega o CSV
-    y_df = pd.read_csv(Y_PATH)
+    # Carrega o CSV (trata strings vazias como NaN)
+    y_df = pd.read_csv(Y_PATH, na_values=['', '""', 'nan', 'NaN', 'None', 'null'])
     print(f"✅ Labels carregados: {len(y_df)} amostras")
     print(f"   • Colunas no DataFrame: {list(y_df.columns)}")
     
@@ -447,11 +452,21 @@ def main():
         else:
             raise ValueError("DataFrame de labels está vazio!")
     
+    # Converte strings vazias para NaN
+    y_df['behavior'] = y_df['behavior'].replace(['', '""'], pd.NA)
+    
     # Mostra estatísticas dos labels
     non_empty = y_df['behavior'].notna().sum()
     empty = y_df['behavior'].isna().sum()
     print(f"   • Registros não vazios: {non_empty:,}")
     print(f"   • Registros vazios/NaN: {empty:,}")
+    
+    # Mostra exemplos de valores não vazios
+    if non_empty > 0:
+        sample_non_empty = y_df[y_df['behavior'].notna()]['behavior'].head(5)
+        print(f"   • Exemplos de valores não vazios:")
+        for i, val in enumerate(sample_non_empty):
+            print(f"      [{i}] {repr(str(val)[:100])}")
 
     all_labels, label_to_idx = load_label_space(y_df)
     print(f"✅ {len(all_labels)} comportamentos únicos")

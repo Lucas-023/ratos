@@ -190,10 +190,39 @@ categorical_data = {col: [] for col in CATEGORICAL_COLS}
 current_index = 0
 print("🚀 Iniciando consolidação...")
 
+# Estatísticas de diagnóstico
+total_rows_processed = 0
+total_labels_found = 0
+files_with_labels = 0
+files_without_labels = 0
+
 for file_path in tqdm(parquet_files, desc="Consolidando Dados"):
     try:
         df = pd.read_parquet(file_path, engine='fastparquet')
         n_rows = len(df)
+        
+        # Verifica se a coluna de target existe
+        if TARGET_COLUMN not in df.columns:
+            tqdm.write(f"⚠️ Coluna '{TARGET_COLUMN}' não encontrada em {file_path.name}. Pulando labels.")
+            # Ainda processa features, mas pula labels
+            labels_series = pd.Series([pd.NA] * n_rows)
+        else:
+            # --- B) Labels (Y) ---
+            labels_series = df[TARGET_COLUMN].apply(
+                lambda x: ";".join(safe_extract_labels(x)) if safe_extract_labels(x) else pd.NA
+            )
+            # Converte strings vazias para NaN antes de salvar
+            labels_series = labels_series.replace('', pd.NA)
+            
+            # Diagnóstico: conta labels encontrados neste arquivo
+            labels_in_file = labels_series.notna().sum()
+            if labels_in_file > 0:
+                files_with_labels += 1
+                total_labels_found += labels_in_file
+                if files_with_labels <= 3:  # Mostra apenas os primeiros 3 arquivos com labels
+                    tqdm.write(f"   ✅ {file_path.name}: {labels_in_file:,} labels encontrados de {n_rows:,} registros")
+            else:
+                files_without_labels += 1
         
         # --- A) Features Numéricas (X) ---
         # Seleciona apenas as colunas de features numéricas
@@ -207,11 +236,10 @@ for file_path in tqdm(parquet_files, desc="Consolidando Dados"):
         # Escreve no memmap
         X_memmap_temp[current_index : current_index + n_rows] = features_np
         
-        # --- B) Labels (Y) ---
-        labels_series = df[TARGET_COLUMN].apply(
-            lambda x: ";".join(safe_extract_labels(x))
-        )
-        labels_series.to_csv(OUTPUT_Y, mode='a', index=False, header=False, encoding='utf-8')
+        # Salva labels
+        labels_series.to_csv(OUTPUT_Y, mode='a', index=False, header=False, encoding='utf-8', na_rep='')
+        
+        total_rows_processed += n_rows
         
         # --- C) Variáveis Categóricas ---
         for col in CATEGORICAL_COLS:
@@ -233,6 +261,26 @@ for file_path in tqdm(parquet_files, desc="Consolidando Dados"):
 
 # Garante que todos os dados foram escritos
 X_memmap_temp.flush()
+
+# Resumo de diagnóstico de labels
+print("\n" + "="*60)
+print("📊 RESUMO DE DIAGNÓSTICO DE LABELS")
+print("="*60)
+print(f"   • Total de registros processados: {total_rows_processed:,}")
+print(f"   • Registros com labels: {total_labels_found:,}")
+print(f"   • Registros sem labels: {total_rows_processed - total_labels_found:,}")
+print(f"   • Arquivos com labels: {files_with_labels}")
+print(f"   • Arquivos sem labels: {files_without_labels}")
+if total_labels_found == 0:
+    print("\n   ⚠️ ATENÇÃO: NENHUM label foi encontrado!")
+    print("   Possíveis causas:")
+    print("   1. A coluna 'behavior' não existe nos arquivos parquet")
+    print("   2. Todos os valores de 'behavior' estão vazios/NaN")
+    print("   3. O formato dos labels não está sendo reconhecido pela função safe_extract_labels")
+    print("\n   💡 Verifique um arquivo parquet manualmente:")
+    print(f"      df = pd.read_parquet('{parquet_files[0] if parquet_files else 'arquivo.parquet'}')")
+    print("      print(df['behavior'].head(20))")
+print("="*60)
 
 # Salva array final
 print("\n💾 Salvando array final de features...")
