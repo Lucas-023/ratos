@@ -122,8 +122,8 @@ def load_annotation_file(
 
 
 def _aggregate_behaviors(values: pd.Series) -> Any:
-    """Agrupa múltiplos comportamentos no mesmo frame."""
-    behaviors: List[str] = []
+    """Agrupa múltiplos comportamentos no mesmo frame em uma única STRING."""
+    behaviors = []
     for value in values:
         if isinstance(value, list):
             behaviors.extend([str(v).strip() for v in value if str(v).strip()])
@@ -133,7 +133,7 @@ def _aggregate_behaviors(values: pd.Series) -> Any:
             continue
         else:
             str_val = str(value).strip()
-            if not str_val:
+            if not str_val or str_val.lower() == 'nan' or str_val.lower() == 'none':
                 continue
             if ';' in str_val:
                 behaviors.extend([v.strip() for v in str_val.split(';') if v.strip()])
@@ -141,12 +141,14 @@ def _aggregate_behaviors(values: pd.Series) -> Any:
                 behaviors.append(str_val)
 
     if not behaviors:
-        return np.nan
+        return None  # Retorna None para o Pandas tratar como NaN
 
     unique_vals = sorted(set(behaviors))
-    if len(unique_vals) == 1:
-        return unique_vals[0]
-    return unique_vals
+    
+    # --- MUDANÇA PRINCIPAL AQUI ---
+    # Sempre retorna string, nunca lista.
+    # Se tiver mais de um, junta com ";"
+    return ";".join(unique_vals)
 
 
 def merge_tracking_and_annotations(
@@ -154,12 +156,17 @@ def merge_tracking_and_annotations(
     annotation_df: pd.DataFrame,
     verbose: bool = False,
 ) -> pd.DataFrame:
-    """Combina rastreamento com anotações em um único DataFrame."""
+    """
+    Combina rastreamento com anotações, suportando tanto formato frame-a-frame
+    quanto formato de intervalos (start_frame/stop_frame).
+    """
     df = tracking_df.copy()
 
+    # Garante coluna frame no tracking
     if 'frame' not in df.columns:
         df['frame'] = np.arange(len(df), dtype=np.int32)
 
+    # 1. Se não houver anotações, retorna vazio
     if annotation_df is None or annotation_df.empty:
         if verbose:
             print(f"      ⚠️ DataFrame de anotações vazio ou None")
@@ -168,41 +175,103 @@ def merge_tracking_and_annotations(
         return df
 
     ann = annotation_df.copy()
-    if 'frame' not in ann.columns:
-        ann['frame'] = np.arange(len(ann), dtype=np.int32)
 
-    behavior_col = 'behavior'
-    if behavior_col not in ann.columns:
-        candidates = [col for col in ann.columns if 'behavior' in col.lower()]
-        if candidates:
-            behavior_col = candidates[0]
-            if verbose:
-                print(f"      • Usando coluna '{behavior_col}' como behavior")
+    # ==============================================================================
+    # 2. DETECÇÃO E CONVERSÃO DE FORMATO (INTERVALO -> FRAME-A-FRAME)
+    # ==============================================================================
+    # Verifica se é o formato de intervalo (MABe style) detectado no diagnóstico
+    is_interval_format = all(col in ann.columns for col in ['start_frame', 'stop_frame', 'action'])
+    
+    if is_interval_format:
+        if verbose:
+            print("      • Formato de INTERVALO detectado (start_frame/stop_frame). Convertendo...")
+        
+        # Cria uma lista para explodir os intervalos em frames individuais
+        expanded_data = []
+        
+        # Itera sobre os eventos e preenche os frames
+        # Nota: Isso pode ser intensivo, mas é necessário para converter o formato
+        for _, row in ann.iterrows():
+            try:
+                start = int(row['start_frame'])
+                stop = int(row['stop_frame'])
+                action = row['action']
+                
+                # Opcional: Se quiser incluir o ID do rato na ação (ex: "1_sniff")
+                # agent = row['agent_id']
+                # action = f"{agent}_{action}" 
+                
+                # Cria uma entrada para cada frame neste intervalo
+                for f in range(start, stop + 1):
+                    expanded_data.append({'frame': f, 'behavior': action})
+            except ValueError:
+                continue
+                
+        # Cria o novo DataFrame frame-a-frame
+        if expanded_data:
+            ann = pd.DataFrame(expanded_data)
         else:
             if verbose:
-                print(f"      ⚠️ Nenhuma coluna 'behavior' encontrada. Colunas disponíveis: {list(ann.columns)}")
-            if 'behavior' not in df.columns:
-                df['behavior'] = None
+                print("      ⚠️ Falha ao expandir intervalos: nenhum dado gerado.")
+            df['behavior'] = None
             return df
+            
+    # ==============================================================================
+    # 3. PADRONIZAÇÃO DE COLUNAS (CASO NÃO SEJA INTERVALO OU APÓS CONVERSÃO)
+    # ==============================================================================
+    if 'frame' not in ann.columns:
+        # Tenta achar coluna de frame se tiver outro nome
+        if 'frame_id' in ann.columns:
+            ann = ann.rename(columns={'frame_id': 'frame'})
+        else:
+            # Se ainda não tem frame (e não era intervalo), assume sequencial (arriscado, mas fallback)
+            ann['frame'] = np.arange(len(ann), dtype=np.int32)
 
+    # Identifica a coluna de comportamento
+    behavior_col = 'behavior'
+    if behavior_col not in ann.columns:
+        # Prioriza 'action' se existir (comum no MABe), depois busca substrings
+        if 'action' in ann.columns:
+            behavior_col = 'action'
+        else:
+            candidates = [col for col in ann.columns if 'behavior' in col.lower() or 'label' in col.lower() or 'annotation' in col.lower()]
+            if candidates:
+                behavior_col = candidates[0]
+            else:
+                if verbose:
+                    print(f"      ⚠️ Nenhuma coluna de comportamento encontrada. Colunas: {list(ann.columns)}")
+                df['behavior'] = None
+                return df
+
+    if verbose:
+        print(f"      • Usando coluna '{behavior_col}' como behavior")
+
+    # Seleciona apenas as colunas necessárias
     ann = ann[['frame', behavior_col]].rename(columns={behavior_col: 'behavior'})
+    
+    # ==============================================================================
+    # 4. AGRUPAMENTO (TRATA MÚLTIPLOS COMPORTAMENTOS NO MESMO FRAME)
+    # ==============================================================================
+    # Como convertemos intervalos, é possível que no frame 100 o rato 1 esteja fazendo 'sniff'
+    # e o rato 2 esteja fazendo 'other'. Precisamos agrupar isso.
     
     if verbose:
         non_empty_before = ann['behavior'].notna().sum()
-        print(f"      • Anotações antes de agrupar: {non_empty_before}/{len(ann)} não vazias")
+        print(f"      • Registros de anotação para merge: {non_empty_before}")
     
+    # Agrupa comportamentos duplicados no mesmo frame (ex: ['sniff', 'dominance'])
     ann_grouped = (
         ann.groupby('frame')['behavior']
-        .apply(_aggregate_behaviors)
+        .apply(_aggregate_behaviors) # Usa sua função auxiliar existente
         .reset_index()
     )
-    
-    if verbose:
-        non_empty_after = ann_grouped['behavior'].notna().sum()
-        print(f"      • Anotações após agrupar: {non_empty_after}/{len(ann_grouped)} não vazias")
 
+    # ==============================================================================
+    # 5. MERGE FINAL
+    # ==============================================================================
     df = df.merge(ann_grouped, on='frame', how='left', suffixes=('', '_ann'))
 
+    # Consolida a coluna
     if 'behavior_ann' in df.columns:
         if 'behavior' in df.columns:
             df['behavior'] = df['behavior_ann'].combine_first(df['behavior'])
