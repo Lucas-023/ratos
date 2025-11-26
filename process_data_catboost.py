@@ -4,92 +4,88 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import List, Optional, Dict, Any
 import warnings
+import gc
+
 warnings.filterwarnings('ignore')
 
 # =================================================================
-# CONFIGURAÇÕES PARA CATBOOST
+# 1. CONFIGURAÇÕES E CONSTANTES
 # =================================================================
 
-# Colunas de metadados que queremos manter
+# Metadados estáticos para manter
 METADATA_COLUMNS_TO_KEEP_RAW = [
     'frame', 'behavior', 'video_id', 'unique_frame_id',
-    'lab_id', 
-    'frames_per_second', 'video_duration_sec', 'pix_per_cm_approx', 
-    'video_width_pix', 'video_height_pix', 
-    'body_parts_tracked', 'behaviors_labeled', 'tracking_method',
-    'mouse1_strain', 'mouse1_color', 'mouse1_condition', 'mouse1_id',
-    'mouse2_strain', 'mouse2_color', 'mouse2_condition', 'mouse2_id',
-    'mouse3_strain', 'mouse3_color', 'mouse3_condition', 'mouse3_id',
-    'mouse4_strain', 'mouse4_color', 'mouse4_condition', 'mouse4_id',
+    'lab_id', 'frames_per_second', 'video_duration_sec', 
+    'pix_per_cm_approx', 'video_width_pix', 'video_height_pix', 
+    'mouse1_strain', 'mouse1_sex', 'mouse2_strain', 'mouse2_sex'
 ]
 
-# Variáveis categóricas (mantidas como categóricas para CatBoost)
-CATEGORICAL_COLS = [
-    'arena_type', 'arena_shape',
-    'mouse1_sex', 'mouse2_sex', 'mouse3_sex', 'mouse4_sex',
-    'mouse1_strain', 'mouse2_strain', 'mouse3_strain', 'mouse4_strain',
-    'mouse1_color', 'mouse2_color', 'mouse3_color', 'mouse4_color',
-    'mouse1_condition', 'mouse2_condition', 'mouse3_condition', 'mouse4_condition',
-    'lab_id', 'tracking_method',
-]
+# Janelas temporais para cálculo de média/desvio padrão (Rolling Stats)
+# Ex: Média de velocidade nos últimos 5, 15 e 30 frames
+TEMPORAL_WINDOWS = [5, 15, 30]
 
-# Variáveis numéricas de contexto
-NUMERIC_CONTEXT_COLS = [
-    'mouse1_age', 'mouse2_age', 'mouse3_age', 'mouse4_age',
-    'arena_width_cm', 'arena_height_cm',
-    'frames_per_second', 'video_duration_sec', 'pix_per_cm_approx',
-    'video_width_pix', 'video_height_pix',
-]
-
-# Parâmetros para features temporais
-TEMPORAL_WINDOWS = [3, 5, 10, 20]  # Janelas para rolling statistics
-LAG_FEATURES = [1, 2, 3, 5, 10]  # Lags temporais
-
+# Lags: Olhar para trás X frames (importante para causalidade)
+LAG_FEATURES = [1, 5, 10]
 
 # =================================================================
-# FUNÇÕES AUXILIARES
+# 2. FUNÇÕES DE CORREÇÃO DE FORMATO (CRÍTICO)
 # =================================================================
 
-def safe_interpolate(series: pd.Series, limit: int = 10) -> pd.Series:
-    """Interpolação linear segura com limite."""
-    return series.interpolate(method='linear', limit=limit, limit_direction='both')
+def convert_long_to_wide(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converte formato Longo (uma linha por keypoint) para Largo (uma coluna por keypoint).
+    Resolve o problema de não achar as colunas de coordenadas.
+    """
+    required_cols = ['bodypart', 'x', 'y', 'mouse_id']
+    # Se não tiver essas colunas, assume que já está largo ou não é tracking padrão
+    if not all(col in df.columns for col in required_cols):
+        return df
 
+    # Cria identificador único: mouse1, mouse2, etc.
+    # Garante que mouse_id seja tratado como string para concatenação
+    df['mouse_key'] = 'mouse' + df['mouse_id'].astype(str)
+    
+    # Pivota a tabela: Transforma linhas em colunas
+    pivot_df = df.pivot_table(
+        index='video_frame', 
+        columns=['mouse_key', 'bodypart'], 
+        values=['x', 'y']
+    )
+    
+    # Achata as colunas multinível (ex: ('x', 'mouse1', 'nose') -> 'mouse1_nose_x')
+    new_columns = []
+    for val_type, mouse, part in pivot_df.columns:
+        new_columns.append(f"{mouse}_{part}_{val_type}")
+    
+    pivot_df.columns = new_columns
+    pivot_df = pivot_df.reset_index()
+    
+    # Padroniza nome da coluna de frame
+    pivot_df = pivot_df.rename(columns={'video_frame': 'frame'})
+    
+    return pivot_df
+
+# =================================================================
+# 3. FUNÇÕES AUXILIARES DE CARREGAMENTO
+# =================================================================
 
 def load_sequence_metadata(metadata_path: Path) -> pd.DataFrame:
-    """Carrega o arquivo sequence_metadata.csv se existir."""
     if not metadata_path or not metadata_path.exists():
         return pd.DataFrame()
     try:
         return pd.read_csv(metadata_path)
-    except Exception as exc:
-        print(f"⚠️ Não foi possível carregar {metadata_path}: {exc}")
+    except Exception:
         return pd.DataFrame()
 
-
 def build_metadata_lookup(metadata_df: pd.DataFrame) -> Dict[int, Dict[str, Any]]:
-    """Cria um mapa sequence_id -> metadados."""
     if metadata_df.empty or 'sequence_id' not in metadata_df.columns:
         return {}
-
     metadata_df = metadata_df.set_index('sequence_id')
-    lookup: Dict[int, Dict[str, Any]] = {}
-    for seq_id, row in metadata_df.iterrows():
-        try:
-            lookup[int(seq_id)] = row.to_dict()
-        except (ValueError, TypeError):
-            continue
-    return lookup
+    return {int(idx): row.to_dict() for idx, row in metadata_df.iterrows()}
 
-
-def load_annotation_file(
-    sequence_id: str,
-    lab_name: str,
-    annotations_root: Optional[Path],
-    master_annotations_path: Optional[Path],
-) -> pd.DataFrame:
-    """Carrega o arquivo de anotações correspondente ao sequence_id."""
-    candidate_files: List[Path] = []
-
+def load_annotation_file(sequence_id: str, lab_name: str, annotations_root: Optional[Path]) -> pd.DataFrame:
+    """Carrega anotações tentando vários caminhos possíveis."""
+    candidate_files = []
     if annotations_root and annotations_root.exists():
         candidate_files.append(annotations_root / lab_name / f"{sequence_id}.parquet")
         candidate_files.append(annotations_root / f"{sequence_id}.parquet")
@@ -98,730 +94,291 @@ def load_annotation_file(
         if candidate.exists():
             try:
                 return pd.read_parquet(candidate, engine='fastparquet')
-            except Exception as exc:
-                print(f"⚠️ Falha ao ler {candidate}: {exc}")
-
-    if master_annotations_path and master_annotations_path.exists():
-        try:
-            seq_int = int(sequence_id)
-        except ValueError:
-            seq_int = sequence_id
-        try:
-            df_master = pd.read_parquet(
-                master_annotations_path,
-                engine='pyarrow',
-                filters=[('sequence_id', '==', seq_int)],
-            )
-            if 'sequence_id' in df_master.columns:
-                df_master = df_master.drop(columns=['sequence_id'])
-            return df_master
-        except Exception as exc:
-            print(f"⚠️ Falha ao filtrar {master_annotations_path.name} para {sequence_id}: {exc}")
-
+            except Exception:
+                continue
     return pd.DataFrame()
 
-
 def _aggregate_behaviors(values: pd.Series) -> Any:
-    """Agrupa múltiplos comportamentos no mesmo frame em uma única STRING."""
-    behaviors = []
+    """Junta múltiplos comportamentos no mesmo frame em uma string única."""
+    behaviors = set()
     for value in values:
-        if isinstance(value, list):
-            behaviors.extend([str(v).strip() for v in value if str(v).strip()])
-        elif isinstance(value, (tuple, set)):
-            behaviors.extend([str(v).strip() for v in value if str(v).strip()])
-        elif pd.isna(value):
+        val_str = str(value).strip()
+        if not val_str or val_str.lower() in ['nan', 'none']:
             continue
-        else:
-            str_val = str(value).strip()
-            if not str_val or str_val.lower() == 'nan' or str_val.lower() == 'none':
-                continue
-            if ';' in str_val:
-                behaviors.extend([v.strip() for v in str_val.split(';') if v.strip()])
-            else:
-                behaviors.append(str_val)
-
-    if not behaviors:
-        return None  # Retorna None para o Pandas tratar como NaN
-
-    unique_vals = sorted(set(behaviors))
+        # Separa por ponto e vírgula se já vier agrupado
+        for sub_val in val_str.split(';'):
+            if sub_val.strip():
+                behaviors.add(sub_val.strip())
     
-    # --- MUDANÇA PRINCIPAL AQUI ---
-    # Sempre retorna string, nunca lista.
-    # Se tiver mais de um, junta com ";"
-    return ";".join(unique_vals)
+    if not behaviors:
+        return None
+    return ";".join(sorted(behaviors))
 
-
-def merge_tracking_and_annotations(
-    tracking_df: pd.DataFrame,
-    annotation_df: pd.DataFrame,
-    verbose: bool = False,
-) -> pd.DataFrame:
-    """
-    Combina rastreamento com anotações, suportando tanto formato frame-a-frame
-    quanto formato de intervalos (start_frame/stop_frame).
-    """
+def merge_tracking_and_annotations(tracking_df: pd.DataFrame, annotation_df: pd.DataFrame) -> pd.DataFrame:
     df = tracking_df.copy()
-
-    # Garante coluna frame no tracking
     if 'frame' not in df.columns:
         df['frame'] = np.arange(len(df), dtype=np.int32)
 
-    # 1. Se não houver anotações, retorna vazio
     if annotation_df is None or annotation_df.empty:
-        if verbose:
-            print(f"      ⚠️ DataFrame de anotações vazio ou None")
-        if 'behavior' not in df.columns:
-            df['behavior'] = None
+        df['behavior'] = None
         return df
 
     ann = annotation_df.copy()
-
-    # ==============================================================================
-    # 2. DETECÇÃO E CONVERSÃO DE FORMATO (INTERVALO -> FRAME-A-FRAME)
-    # ==============================================================================
-    # Verifica se é o formato de intervalo (MABe style) detectado no diagnóstico
-    is_interval_format = all(col in ann.columns for col in ['start_frame', 'stop_frame', 'action'])
     
-    if is_interval_format:
-        if verbose:
-            print("      • Formato de INTERVALO detectado (start_frame/stop_frame). Convertendo...")
-        
-        # Cria uma lista para explodir os intervalos em frames individuais
-        expanded_data = []
-        
-        # Itera sobre os eventos e preenche os frames
-        # Nota: Isso pode ser intensivo, mas é necessário para converter o formato
+    # Lógica para converter formato de Intervalo (start/stop) para Frame-a-Frame
+    if all(c in ann.columns for c in ['start_frame', 'stop_frame', 'action']):
+        expanded = []
         for _, row in ann.iterrows():
             try:
-                start = int(row['start_frame'])
-                stop = int(row['stop_frame'])
-                action = row['action']
-                
-                # Opcional: Se quiser incluir o ID do rato na ação (ex: "1_sniff")
-                # agent = row['agent_id']
-                # action = f"{agent}_{action}" 
-                
-                # Cria uma entrada para cada frame neste intervalo
-                for f in range(start, stop + 1):
-                    expanded_data.append({'frame': f, 'behavior': action})
-            except ValueError:
-                continue
-                
-        # Cria o novo DataFrame frame-a-frame
-        if expanded_data:
-            ann = pd.DataFrame(expanded_data)
-        else:
-            if verbose:
-                print("      ⚠️ Falha ao expandir intervalos: nenhum dado gerado.")
-            df['behavior'] = None
-            return df
-            
-    # ==============================================================================
-    # 3. PADRONIZAÇÃO DE COLUNAS (CASO NÃO SEJA INTERVALO OU APÓS CONVERSÃO)
-    # ==============================================================================
-    if 'frame' not in ann.columns:
-        # Tenta achar coluna de frame se tiver outro nome
-        if 'frame_id' in ann.columns:
-            ann = ann.rename(columns={'frame_id': 'frame'})
-        else:
-            # Se ainda não tem frame (e não era intervalo), assume sequencial (arriscado, mas fallback)
-            ann['frame'] = np.arange(len(ann), dtype=np.int32)
+                for f in range(int(row['start_frame']), int(row['stop_frame']) + 1):
+                    expanded.append({'frame': f, 'behavior': row['action']})
+            except: continue
+        ann = pd.DataFrame(expanded) if expanded else pd.DataFrame(columns=['frame', 'behavior'])
 
-    # Identifica a coluna de comportamento
-    behavior_col = 'behavior'
-    if behavior_col not in ann.columns:
-        # Prioriza 'action' se existir (comum no MABe), depois busca substrings
-        if 'action' in ann.columns:
-            behavior_col = 'action'
-        else:
-            candidates = [col for col in ann.columns if 'behavior' in col.lower() or 'label' in col.lower() or 'annotation' in col.lower()]
-            if candidates:
-                behavior_col = candidates[0]
-            else:
-                if verbose:
-                    print(f"      ⚠️ Nenhuma coluna de comportamento encontrada. Colunas: {list(ann.columns)}")
-                df['behavior'] = None
-                return df
+    # Padronização de colunas
+    if 'frame' not in ann.columns and 'frame_id' in ann.columns:
+        ann = ann.rename(columns={'frame_id': 'frame'})
+    
+    # Identifica coluna de comportamento
+    behavior_col = next((c for c in ann.columns if c in ['behavior', 'action', 'annotation']), None)
+    
+    if not behavior_col or ann.empty:
+        df['behavior'] = None
+        return df
 
-    if verbose:
-        print(f"      • Usando coluna '{behavior_col}' como behavior")
-
-    # Seleciona apenas as colunas necessárias
     ann = ann[['frame', behavior_col]].rename(columns={behavior_col: 'behavior'})
     
-    # ==============================================================================
-    # 4. AGRUPAMENTO (TRATA MÚLTIPLOS COMPORTAMENTOS NO MESMO FRAME)
-    # ==============================================================================
-    # Como convertemos intervalos, é possível que no frame 100 o rato 1 esteja fazendo 'sniff'
-    # e o rato 2 esteja fazendo 'other'. Precisamos agrupar isso.
-    
-    if verbose:
-        non_empty_before = ann['behavior'].notna().sum()
-        print(f"      • Registros de anotação para merge: {non_empty_before}")
-    
-    # Agrupa comportamentos duplicados no mesmo frame (ex: ['sniff', 'dominance'])
-    ann_grouped = (
-        ann.groupby('frame')['behavior']
-        .apply(_aggregate_behaviors) # Usa sua função auxiliar existente
-        .reset_index()
-    )
+    # Agrupa comportamentos duplicados no mesmo frame
+    ann_grouped = ann.groupby('frame')['behavior'].apply(_aggregate_behaviors).reset_index()
 
-    # ==============================================================================
-    # 5. MERGE FINAL
-    # ==============================================================================
-    df = df.merge(ann_grouped, on='frame', how='left', suffixes=('', '_ann'))
-
-    # Consolida a coluna
-    if 'behavior_ann' in df.columns:
-        if 'behavior' in df.columns:
-            df['behavior'] = df['behavior_ann'].combine_first(df['behavior'])
-        else:
-            df['behavior'] = df['behavior_ann']
-        df.drop(columns=['behavior_ann'], inplace=True)
-
-    if 'behavior' not in df.columns:
-        df['behavior'] = None
-
+    # Merge
+    df = df.merge(ann_grouped, on='frame', how='left')
     return df
 
-
-def inject_metadata_columns(
-    df: pd.DataFrame,
-    sequence_id: str,
-    lab_name: str,
-    metadata_lookup: Dict[int, Dict[str, Any]],
-) -> pd.DataFrame:
-    """Adiciona colunas de metadados usando sequence_metadata.csv."""
-    df = df.copy()
-
-    try:
-        seq_int = int(sequence_id)
-    except (ValueError, TypeError):
-        seq_int = None
-
-    metadata_values = metadata_lookup.get(seq_int, {}) if seq_int is not None else {}
-
-    df['lab_id'] = df.get('lab_id', lab_name)
-    df['video_id'] = df.get('video_id', f"{lab_name}_{sequence_id}")
-
-    for col, value in metadata_values.items():
-        if col in df.columns:
-            continue
-        df[col] = value
-
-    defaults = {
-        'pix_per_cm_approx': 1.0,
-        'frames_per_second': 30.0,
-        'video_width_pix': np.nan,
-        'video_height_pix': np.nan,
-    }
-    for col, default_value in defaults.items():
-        if col not in df.columns:
-            df[col] = default_value
-
-    if 'video_duration_sec' not in df.columns:
-        fps = pd.to_numeric(df['frames_per_second'], errors='coerce').fillna(30.0)
-        if not df.empty:
-            df['video_duration_sec'] = df['frame'].max() / max(fps.iloc[0], 1.0)
-        else:
-            df['video_duration_sec'] = np.nan
-
-    if 'unique_frame_id' not in df.columns:
-        df['unique_frame_id'] = df['video_id'].astype(str) + "_" + df['frame'].astype(str)
-
-    return df
-
-
-def prepare_tracking_dataframe(
-    tracking_path: Path,
-    annotations_root: Optional[Path],
-    master_annotations_path: Optional[Path],
-    metadata_lookup: Dict[int, Dict[str, Any]],
-    tracking_root: Path,
-    verbose_diagnostics: bool = False,
-) -> pd.DataFrame:
-    """Carrega o arquivo de tracking e injeta anotações + metadados."""
-    try:
-        df_tracking = pd.read_parquet(tracking_path, engine='fastparquet')
-    except Exception as exc:
-        print(f"⚠️ Falha ao ler {tracking_path.name}: {exc}")
-        return pd.DataFrame()
-
-    try:
-        relative_parts = tracking_path.relative_to(tracking_root).parts
-        lab_name = relative_parts[0]
-    except ValueError:
-        lab_name = tracking_path.parent.name
-
-    sequence_id = tracking_path.stem
+def inject_metadata_columns(df: pd.DataFrame, sequence_id: str, lab_name: str, metadata_lookup: Dict) -> pd.DataFrame:
+    try: seq_int = int(sequence_id)
+    except: seq_int = None
     
-    # Diagnóstico: verifica se arquivos de anotação existem
-    if verbose_diagnostics:
-        print(f"\n🔍 Diagnóstico para {tracking_path.name}:")
-        print(f"   • Lab: {lab_name}")
-        print(f"   • Sequence ID: {sequence_id}")
-        if annotations_root and annotations_root.exists():
-            candidate1 = annotations_root / lab_name / f"{sequence_id}.parquet"
-            candidate2 = annotations_root / f"{sequence_id}.parquet"
-            print(f"   • Candidato 1 existe? {candidate1.exists()}: {candidate1}")
-            print(f"   • Candidato 2 existe? {candidate2.exists()}: {candidate2}")
-        if master_annotations_path and master_annotations_path.exists():
-            print(f"   • Master annotations existe: {master_annotations_path}")
+    meta = metadata_lookup.get(seq_int, {})
+    df['video_id'] = f"{lab_name}_{sequence_id}"
     
-    annotation_df = load_annotation_file(
-        sequence_id=sequence_id,
-        lab_name=lab_name,
-        annotations_root=annotations_root,
-        master_annotations_path=master_annotations_path,
-    )
-
-    # Diagnóstico: verifica se anotações foram carregadas
-    if verbose_diagnostics:
-        if annotation_df.empty:
-            print(f"   ⚠️ Nenhuma anotação encontrada para {sequence_id}")
-        else:
-            print(f"   ✅ Anotações carregadas: {len(annotation_df)} registros")
-            if 'behavior' in annotation_df.columns:
-                non_empty = annotation_df['behavior'].notna().sum()
-                print(f"   • Registros com behavior: {non_empty}/{len(annotation_df)}")
-                if non_empty > 0:
-                    print(f"   • Exemplos: {annotation_df['behavior'].dropna().head(3).tolist()}")
-
-    df_combined = merge_tracking_and_annotations(df_tracking, annotation_df, verbose=verbose_diagnostics)
-    
-    # Diagnóstico final: verifica se behavior foi mesclado
-    if verbose_diagnostics:
-        if 'behavior' in df_combined.columns:
-            non_empty_final = df_combined['behavior'].notna().sum()
-            print(f"   • Após merge: {non_empty_final}/{len(df_combined)} registros com behavior")
-        else:
-            print(f"   ⚠️ Coluna 'behavior' não existe após merge!")
-    
-    df_enriched = inject_metadata_columns(
-        df=df_combined,
-        sequence_id=sequence_id,
-        lab_name=lab_name,
-        metadata_lookup=metadata_lookup,
-    )
-    return df_enriched
-
-
-
-
-def add_temporal_features(df: pd.DataFrame, group_col: str = 'video_id') -> pd.DataFrame:
-    """
-    Adiciona features temporais essenciais para modelos de árvore:
-    - Lags (valores anteriores)
-    - Rolling statistics (média, std, min, max)
-    - Diferenças temporais
-    """
-    df = df.copy()
-    df = df.sort_values([group_col, 'frame']).reset_index(drop=True)
-    
-    # Features de movimento e distância para aplicar lags
-    movement_cols = [col for col in df.columns if 'speed' in col or 'dist_' in col or 'accel' in col]
-    coord_cols = [col for col in df.columns if col.endswith('_cm_x') or col.endswith('_cm_y')]
-    
-    all_temporal_cols = movement_cols + coord_cols[:20]  # Limita para não criar muitas features
-    
-    new_features = []
-    
-    for col in all_temporal_cols:
-        if col not in df.columns:
-            continue
+    for k, v in meta.items():
+        if k not in df.columns:
+            df[k] = v
             
-        # Lags temporais
+    # Garante colunas essenciais para cálculo
+    if 'pix_per_cm_approx' not in df.columns: df['pix_per_cm_approx'] = 1.0
+    if 'frames_per_second' not in df.columns: df['frames_per_second'] = 30.0
+    
+    return df
+
+# =================================================================
+# 4. PIPELINE DE FEATURE ENGINEERING (ROBUSTO)
+# =================================================================
+
+def calculate_angle(x1, y1, x2, y2):
+    """Calcula ângulo em radianos entre dois pontos."""
+    return np.arctan2(y2 - y1, x2 - x1)
+
+def pipeline_feature_engineering_robust(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pipeline completo que gera features cinemáticas, sociais e temporais.
+    """
+    if df.empty: return pd.DataFrame()
+    
+    # Trabalha em uma cópia para evitar FragmentedFrameError
+    df = df.copy()
+    
+    # 1. Tratamento Inicial de Coordenadas
+    # ---------------------------------------------------------
+    coord_cols = [c for c in df.columns if c.endswith('_x') or c.endswith('_y')]
+    for col in coord_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        # Interpolação para corrigir falhas de tracking
+        df[col] = df[col].interpolate(method='linear', limit=10, limit_direction='both')
+
+    # Dataframe separado para features novas (evita fragmentação de memória)
+    feats = pd.DataFrame(index=df.index)
+    
+    pix_per_cm = df['pix_per_cm_approx'].replace(0, np.nan).fillna(1.0)
+    
+    # 2. Features Individuais (Velocidade, Aceleração, Ângulos)
+    # ---------------------------------------------------------
+    for m in range(1, 5): # Para cada rato (1 a 4)
+        mouse_prefix = f"mouse{m}"
+        
+        # Tenta encontrar centro do corpo (prioriza 'body_center', 'spine', 'centroid')
+        cols_x = [c for c in df.columns if c.startswith(mouse_prefix) and c.endswith('_x')]
+        cols_y = [c for c in df.columns if c.startswith(mouse_prefix) and c.endswith('_y')]
+        
+        if not cols_x: continue
+
+        # Define centróide (usa body_center se tiver, senão o primeiro keypoint achado)
+        centroid_x_col = next((c for c in cols_x if 'body_center' in c), cols_x[0])
+        centroid_y_col = next((c for c in cols_y if 'body_center' in c), cols_y[0])
+        
+        # Converte para CM
+        cx = df[centroid_x_col] / pix_per_cm
+        cy = df[centroid_y_col] / pix_per_cm
+        
+        feats[f'{mouse_prefix}_x_cm'] = cx
+        feats[f'{mouse_prefix}_y_cm'] = cy
+        
+        # Velocidade
+        vx = cx.diff().fillna(0)
+        vy = cy.diff().fillna(0)
+        speed = np.sqrt(vx**2 + vy**2)
+        feats[f'{mouse_prefix}_speed_cm'] = speed
+        
+        # Aceleração (variação da velocidade)
+        feats[f'{mouse_prefix}_accel'] = speed.diff().fillna(0)
+        
+        # Ângulo de Orientação (Cabeça vs Corpo)
+        # Tenta achar nariz e base da cauda para direção precisa
+        nose_x = next((c for c in cols_x if 'nose' in c), None)
+        tail_x = next((c for c in cols_x if 'tail' in c or 'spine' in c), None)
+        
+        if nose_x and tail_x:
+            nose_y = nose_x.replace('_x', '_y')
+            tail_y = tail_x.replace('_x', '_y')
+            
+            # Calcula ângulo (em radianos)
+            feats[f'{mouse_prefix}_angle'] = calculate_angle(
+                df[tail_x], df[tail_y], df[nose_x], df[nose_y]
+            ).fillna(0)
+            
+            # Velocidade Angular (o quanto ele gira)
+            feats[f'{mouse_prefix}_angular_vel'] = feats[f'{mouse_prefix}_angle'].diff().fillna(0)
+
+    # 3. Features Sociais (Interação entre Ratos)
+    # ---------------------------------------------------------
+    active_mice = [m for m in range(1, 5) if f'mouse{m}_x_cm' in feats.columns]
+    
+    import itertools
+    for m1, m2 in itertools.combinations(active_mice, 2):
+        prefix = f"m{m1}_m{m2}"
+        
+        x1, y1 = feats[f'mouse{m1}_x_cm'], feats[f'mouse{m1}_y_cm']
+        x2, y2 = feats[f'mouse{m2}_x_cm'], feats[f'mouse{m2}_y_cm']
+        
+        # Distância Euclidiana
+        dist = np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+        feats[f'dist_{prefix}'] = dist
+        
+        # Velocidade Relativa (estão se aproximando ou afastando?)
+        # Derivada da distância: negativo = aproximando, positivo = afastando
+        feats[f'rel_vel_{prefix}'] = dist.diff().fillna(0)
+        
+        # Ratos estão de frente um pro outro? (Diferença de ângulos)
+        if f'mouse{m1}_angle' in feats and f'mouse{m2}_angle' in feats:
+            angle_diff = np.abs(feats[f'mouse{m1}_angle'] - feats[f'mouse{m2}_angle'])
+            # Normaliza para [0, pi]
+            angle_diff = np.abs((angle_diff + np.pi) % (2 * np.pi) - np.pi)
+            feats[f'angle_diff_{prefix}'] = angle_diff
+
+    # 4. Features Temporais (Lags e Rolling Windows)
+    # ---------------------------------------------------------
+    # Aplica apenas nas colunas de cinemática e distância para não explodir a memória
+    target_cols_for_temporal = [c for c in feats.columns if 'speed' in c or 'dist' in c or 'angle' in c]
+    
+    # Limita a 10 colunas mais importantes se tiver muitas, para economizar tempo/memória
+    if len(target_cols_for_temporal) > 20:
+        target_cols_for_temporal = [c for c in target_cols_for_temporal if 'speed' in c or 'dist' in c][:20]
+
+    for col in target_cols_for_temporal:
+        # Lags (Valores passados)
         for lag in LAG_FEATURES:
-            lag_col = f'{col}_lag{lag}'
-            df[lag_col] = df.groupby(group_col)[col].shift(lag)
-            new_features.append(lag_col)
+            feats[f'{col}_lag{lag}'] = feats[col].shift(lag).fillna(0)
         
-        # Rolling statistics
+        # Rolling Stats (Tendência recente)
         for window in TEMPORAL_WINDOWS:
-            grouped = df.groupby(group_col)[col]
-            
-            # Média móvel
-            mean_col = f'{col}_rolling_mean_{window}'
-            df[mean_col] = grouped.transform(lambda x: x.rolling(window, min_periods=1).mean())
-            new_features.append(mean_col)
-            
-            # Desvio padrão móvel
-            std_col = f'{col}_rolling_std_{window}'
-            df[std_col] = grouped.transform(lambda x: x.rolling(window, min_periods=1).std().fillna(0))
-            new_features.append(std_col)
-            
-            # Máximo móvel
-            max_col = f'{col}_rolling_max_{window}'
-            df[max_col] = grouped.transform(lambda x: x.rolling(window, min_periods=1).max())
-            new_features.append(max_col)
-            
-            # Mínimo móvel
-            min_col = f'{col}_rolling_min_{window}'
-            df[min_col] = grouped.transform(lambda x: x.rolling(window, min_periods=1).min())
-            new_features.append(min_col)
-        
-        # Diferença temporal (derivada)
-        diff_col = f'{col}_diff'
-        df[diff_col] = df.groupby(group_col)[col].diff()
-        new_features.append(diff_col)
-    
-    return df, new_features
+            rolling = feats[col].rolling(window=window, min_periods=1)
+            feats[f'{col}_mean_{window}'] = rolling.mean().fillna(0)
+            feats[f'{col}_std_{window}'] = rolling.std().fillna(0)
+            # Max pode ser útil para detectar picos de agressividade (ataques rápidos)
+            if 'speed' in col:
+                feats[f'{col}_max_{window}'] = rolling.max().fillna(0)
 
-
-def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adiciona features de interação entre ratos (útil para comportamento social).
-    """
-    df = df.copy()
-    new_features = []
+    # 5. Consolidação Final
+    # ---------------------------------------------------------
+    # Garante que metadados e target estão presentes
+    cols_meta_present = [c for c in METADATA_COLUMNS_TO_KEEP_RAW + ['behavior'] if c in df.columns]
     
-    # Distâncias entre ratos (já calculadas, mas podemos adicionar mais)
-    mouse_pairs = [(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)]
+    # Concatena features novas com metadados originais
+    df_final = pd.concat([df[cols_meta_present], feats], axis=1)
     
-    # Velocidades relativas
-    for m1, m2 in mouse_pairs:
-        speed1_col = f'mouse{m1}_speed_cm_per_frame'
-        speed2_col = f'mouse{m2}_speed_cm_per_frame'
-        dist_col = f'dist_m{m1}_m{m2}_cm'
-        
-        if all(col in df.columns for col in [speed1_col, speed2_col]):
-            rel_speed_col = f'rel_speed_m{m1}_m{m2}'
-            df[rel_speed_col] = np.abs(df[speed1_col] - df[speed2_col])
-            new_features.append(rel_speed_col)
-        
-        # Razão de velocidade sobre distância (proximidade relativa)
-        if all(col in df.columns for col in [speed1_col, speed2_col, dist_col]):
-            proximity_col = f'proximity_speed_m{m1}_m{m2}'
-            df[proximity_col] = (df[speed1_col] + df[speed2_col]) / (df[dist_col] + 1e-6)
-            new_features.append(proximity_col)
-    
-    return df, new_features
-
-
-# =================================================================
-# PIPELINE PRINCIPAL PARA CATBOOST
-# =================================================================
-
-def pipeline_feature_engineering_catboost(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pipeline de feature engineering otimizado para CatBoost.
-    
-    Diferenças principais em relação ao pipeline original:
-    1. Mantém variáveis categóricas como categóricas (sem OHE)
-    2. Não normaliza features numéricas (CatBoost não precisa)
-    3. Adiciona features temporais (lags, rolling stats)
-    4. Trata valores ausentes de forma adequada para CatBoost
-    """
-    
-    if df.empty:
-        return pd.DataFrame()
-
-    df = df.copy()
-    
-    # --------------------------------------------------------------------------------
-    # 1. Pré-processamento e Normalização CM (mantido do pipeline original)
-    # --------------------------------------------------------------------------------
-    coord_cols_raw = [col for col in df.columns 
-                      if (col.endswith('_x') or col.endswith('_y')) and col.startswith('mouse')]
-
-    # Garante que as colunas críticas são numéricas
-    for col in coord_cols_raw:
-        df.loc[:, col] = pd.to_numeric(df[col], errors='coerce').astype(float)
-    
-    if 'pix_per_cm_approx' in df.columns:
-        df.loc[:, 'pix_per_cm_approx'] = pd.to_numeric(df['pix_per_cm_approx'], errors='coerce').astype(float)
-    
-    # Padroniza 0.0 como NaN
-    df.loc[:, coord_cols_raw] = df.loc[:, coord_cols_raw].replace(0.0, np.nan)
-    
-    # Interpolação Linear
-    for col in coord_cols_raw:
-        df.loc[:, col] = df.groupby('video_id')[col].transform(safe_interpolate)
-    
-    # Calcula o centro do corpo
-    center_cols_pix = []
-    for m in range(1, 5):
-        hip_left_x = f'mouse{m}_hip_left_x'
-        hip_right_x = f'mouse{m}_hip_right_x'
-        hip_left_y = f'mouse{m}_hip_left_y'
-        hip_right_y = f'mouse{m}_hip_right_y'
-        
-        center_x = f'mouse{m}_body_center_x'
-        center_y = f'mouse{m}_body_center_y'
-
-        if hip_left_x in df.columns and hip_right_x in df.columns:
-            df.loc[:, center_x] = ((df[hip_left_x] + df[hip_right_x]) / 2.0).astype(float)
-            df.loc[:, center_y] = ((df[hip_left_y] + df[hip_right_y]) / 2.0).astype(float)
-            center_cols_pix.extend([center_x, center_y])
-    
-    all_coord_cols_pix = coord_cols_raw + center_cols_pix
-
-    # Normalização: Pixels para Centímetros (CM)
-    df_cm = pd.DataFrame(index=df.index)
-    cm_cols = []
-    for col in all_coord_cols_pix:
-        col_cm = col.replace('_x', '_cm_x').replace('_y', '_cm_y')
-        df_cm.loc[:, col_cm] = (df[col] / df['pix_per_cm_approx']).astype(float)
-        cm_cols.append(col_cm)
-
-    # --------------------------------------------------------------------------------
-    # 2. Geração de Features de Velocidade, Distância e Aceleração
-    # --------------------------------------------------------------------------------
-    df_kinematics = pd.DataFrame(index=df.index)
-    speed_cols = []
-    
-    # Velocidade
-    for m in range(1, 5):
-        center_x_cm = f'mouse{m}_body_center_cm_x'
-        center_y_cm = f'mouse{m}_body_center_cm_y'
-        
-        if center_x_cm in df_cm.columns:
-            delta_x = df_cm.groupby(df['video_id'])[center_x_cm].diff()
-            delta_y = df_cm.groupby(df['video_id'])[center_y_cm].diff()
-            
-            speed_col_name = f'mouse{m}_speed_cm_per_frame'
-            df_kinematics.loc[:, speed_col_name] = np.sqrt(delta_x**2 + delta_y**2)
-            speed_cols.append(speed_col_name)
-
-    # Distância Social
-    mouse_pairs = [(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)]
-    dist_cols = []
-    for m1, m2 in mouse_pairs:
-        dist_col_name = f'dist_m{m1}_m{m2}_cm'
-        center1_x = f'mouse{m1}_body_center_cm_x'
-        center1_y = f'mouse{m1}_body_center_cm_y'
-        center2_x = f'mouse{m2}_body_center_cm_x'
-        center2_y = f'mouse{m2}_body_center_cm_y'
-        
-        if center1_x in df_cm.columns and center2_x in df_cm.columns:
-            df_kinematics.loc[:, dist_col_name] = np.sqrt(
-                (df_cm[center1_x] - df_cm[center2_x])**2 +
-                (df_cm[center1_y] - df_cm[center2_y])**2
-            )
-            dist_cols.append(dist_col_name)
-    
-    # Features de Postura e Ângulo
-    angle_cols = []
-    for m in range(1, 5):
-        tail_x = f'mouse{m}_tail_base_cm_x'
-        tail_y = f'mouse{m}_tail_base_cm_y'
-        nose_x = f'mouse{m}_nose_cm_x'
-        nose_y = f'mouse{m}_nose_cm_y'
-        
-        if tail_x in df_cm.columns and nose_x in df_cm.columns:
-            dx = df_cm[nose_x] - df_cm[tail_x]
-            dy = df_cm[nose_y] - df_cm[tail_y]
-            
-            angle_col_name = f'mouse{m}_body_angle_rad'
-            df_kinematics.loc[:, angle_col_name] = np.arctan2(dy, dx)
-            angle_cols.append(angle_col_name)
-
-    # Features de Aceleração
-    accel_cols = []
-    for speed_col in speed_cols:
-        accel_col_name = speed_col.replace('speed', 'accel')
-        df_kinematics.loc[:, accel_col_name] = df_kinematics.groupby(df['video_id'])[speed_col].diff()
-        accel_cols.append(accel_col_name)
-
-    # Features de Distância a Pontos Chave
-    point_dist_cols = []
-    for m1, m2 in mouse_pairs:
-        nose1_x, nose1_y = f'mouse{m1}_nose_cm_x', f'mouse{m1}_nose_cm_y'
-        tail2_x, tail2_y = f'mouse{m2}_tail_base_cm_x', f'mouse{m2}_tail_base_cm_y'
-        nose2_x, nose2_y = f'mouse{m2}_nose_cm_x', f'mouse{m2}_nose_cm_y'
-        tail1_x, tail1_y = f'mouse{m1}_tail_base_cm_x', f'mouse{m1}_tail_base_cm_y'
-        
-        if nose1_x in df_cm.columns and tail2_x in df_cm.columns:
-            dist_col_name_1_2 = f'dist_nose{m1}_tail{m2}_cm'
-            df_kinematics.loc[:, dist_col_name_1_2] = np.sqrt(
-                (df_cm[nose1_x] - df_cm[tail2_x])**2 +
-                (df_cm[nose1_y] - df_cm[tail2_y])**2
-            )
-            point_dist_cols.append(dist_col_name_1_2)
-
-        if nose2_x in df_cm.columns and tail1_x in df_cm.columns:
-            dist_col_name_2_1 = f'dist_nose{m2}_tail{m1}_cm'
-            df_kinematics.loc[:, dist_col_name_2_1] = np.sqrt(
-                (df_cm[nose2_x] - df_cm[tail1_x])**2 +
-                (df_cm[nose2_y] - df_cm[tail1_y])**2
-            )
-            point_dist_cols.append(dist_col_name_2_1)
-
-    # --------------------------------------------------------------------------------
-    # 3. Features Temporais (NOVO - Essencial para CatBoost com dados temporais)
-    # --------------------------------------------------------------------------------
-    # Concatena features básicas antes de adicionar temporais
-    df_temp = pd.concat([df_cm, df_kinematics], axis=1)
-    df_temp['video_id'] = df['video_id'].values
-    df_temp['frame'] = df['frame'].values if 'frame' in df.columns else df.index
-    
-    # Adiciona features temporais
-    df_temp, temporal_features = add_temporal_features(df_temp, group_col='video_id')
-    
-    # Adiciona features de interação
-    df_temp, interaction_features = add_interaction_features(df_temp)
-    
-    # --------------------------------------------------------------------------------
-    # 4. Processamento de Metadados (OTIMIZADO PARA CATBOOST)
-    # --------------------------------------------------------------------------------
-    # Mantém variáveis categóricas como categóricas (sem OHE)
-    categorical_cols_present = [col for col in CATEGORICAL_COLS if col in df.columns]
-    numeric_cols_present = [col for col in NUMERIC_CONTEXT_COLS if col in df.columns]
-    context_cols = categorical_cols_present + numeric_cols_present
-
-    if context_cols:
-        df_context = df[context_cols].copy()
-    else:
-        df_context = pd.DataFrame(index=df.index)
-
-    # Garante que todas as numéricas existam, mesmo que preenchidas com NaN
-    for col in NUMERIC_CONTEXT_COLS:
-        if col not in df_context.columns:
-            df_context[col] = np.nan
-
-    for col in categorical_cols_present:
-        df_context[col] = df_context[col].astype('category')
-
-    # Variáveis numéricas de contexto (sem normalização - CatBoost não precisa)
-    for col in NUMERIC_CONTEXT_COLS:
-        if col in df_context.columns:
-            df_context.loc[:, col] = pd.to_numeric(df_context[col], errors='coerce')
-    
-    # --------------------------------------------------------------------------------
-    # 5. Concatenação Final (CORRIGIDO - Remove duplicatas)
-    # --------------------------------------------------------------------------------
-    base_cols = list(set(METADATA_COLUMNS_TO_KEEP_RAW) & set(df.columns))
-    df_final = df[base_cols].copy()
-
-    # Seleciona apenas as colunas numéricas de df_temp (exclui video_id e frame que já estão em base_cols)
-    temp_numeric_cols = [col for col in df_temp.columns 
-                        if col not in ['video_id', 'frame'] and df_temp[col].dtype in [np.float32, np.float64, np.int32, np.int64]]
-    
-    # Remove de df_context as colunas que já existem em df_final
-    context_cols_to_add = [col for col in df_context.columns if col not in df_final.columns]
-    df_context_filtered = df_context[context_cols_to_add] if context_cols_to_add else pd.DataFrame(index=df_context.index)
-    
-    df_final = pd.concat([
-        df_final,
-        df_temp[temp_numeric_cols],
-        df_context_filtered  # Usa apenas colunas não duplicadas
-    ], axis=1)
-    
-    # Segurança adicional: Remove quaisquer duplicatas que possam ter passado
+    # Tratamento final de memória
     df_final = df_final.loc[:, ~df_final.columns.duplicated()]
     
-    return df_final.reset_index(drop=True)
-
+    # Converte tipos para economizar espaço
+    fcols = df_final.select_dtypes('float').columns
+    df_final[fcols] = df_final[fcols].astype('float32')
+    
+    return df_final
 
 # =================================================================
-# EXECUÇÃO DA PIPELINE
+# 5. EXECUÇÃO PRINCIPAL
 # =================================================================
 
 if __name__ == "__main__":
+    # Caminhos
     TRACKING_ROOT = Path("MABe-mouse-behavior-detection/train_tracking")
     ANNOTATIONS_ROOT = Path("MABe-mouse-behavior-detection/train_annotation")
-    MASTER_ANNOTATIONS_PATH = Path("MABe-mouse-behavior-detection/train_annotations.parquet")
     SEQUENCE_METADATA_PATH = Path("MABe-mouse-behavior-detection/sequence_metadata.csv")
     OUTPUT_PATH = Path("MABe-mouse-behavior-detection/feature_engineered_data_catboost")
 
-    # ===== DIAGNÓSTICO INICIAL =====
-    print("🔍 DIAGNÓSTICO INICIAL:")
-    print(f"   TRACKING_ROOT existe? {TRACKING_ROOT.exists()}")
-    print(f"   ANNOTATIONS_ROOT existe? {ANNOTATIONS_ROOT.exists()}")
-    print(f"   MASTER_ANNOTATIONS existe? {MASTER_ANNOTATIONS_PATH.exists()}")
-    print(f"   SEQUENCE_METADATA existe? {SEQUENCE_METADATA_PATH.exists()}")
-    print()
-
-    metadata_df = load_sequence_metadata(SEQUENCE_METADATA_PATH)
-    metadata_lookup = build_metadata_lookup(metadata_df)
-    print(f"✅ Metadados carregados: {len(metadata_lookup)} sequências")
-
+    # Setup
     OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
-
-    if not TRACKING_ROOT.exists():
-        raise FileNotFoundError(
-            f"Pasta de tracking não encontrada: {TRACKING_ROOT}. "
-            "Verifique se o dataset do Kaggle está no caminho correto."
-        )
-
+    metadata_lookup = build_metadata_lookup(load_sequence_metadata(SEQUENCE_METADATA_PATH))
     tracking_files = list(TRACKING_ROOT.rglob("*.parquet"))
 
     if not tracking_files:
-        print(f"❌ Nenhum arquivo de tracking encontrado em {TRACKING_ROOT.resolve()}")
-    else:
-        print(f"🔍 Encontrados {len(tracking_files)} arquivos de tracking.")
-        print(f"   Exemplo: {tracking_files[0]}")
-        print("🚀 Preparando dados diretamente de train_tracking/train_annotation ...\n")
+        print(f"❌ Erro: Nenhum arquivo em {TRACKING_ROOT}")
+        exit()
 
-        # ===== PROCESSAMENTO COMPLETO =====
-        successful = 0
-        failed = 0
-        files_with_labels = 0
-        files_without_labels = 0
-        total_labels_count = 0
-        
-        for file_path in tqdm(tracking_files, desc="Processando Features para CatBoost"):
-            try:
-                df_raw = prepare_tracking_dataframe(
-                    tracking_path=file_path,
-                    annotations_root=ANNOTATIONS_ROOT,
-                    master_annotations_path=MASTER_ANNOTATIONS_PATH,
-                    metadata_lookup=metadata_lookup,
-                    tracking_root=TRACKING_ROOT,
-                )
+    print(f"🚀 Iniciando Processamento ROBUSTO de {len(tracking_files)} arquivos...")
+    print(f"ℹ️  Isso vai demorar mais que o anterior, pois calcula estatísticas complexas.")
 
-                if df_raw.empty:
-                    tqdm.write(f"⚠️ Dados vazios em {file_path.name}. Pulando.")
-                    failed += 1
-                    continue
-
-                # Verifica se há labels antes de processar
-                if 'behavior' in df_raw.columns:
-                    labels_count = df_raw['behavior'].notna().sum()
-                    if labels_count > 0:
-                        files_with_labels += 1
-                        total_labels_count += labels_count
-                    else:
-                        files_without_labels += 1
-                else:
-                    files_without_labels += 1
-
-                df_processed = pipeline_feature_engineering_catboost(df_raw)
-                
-                # Verifica se behavior foi preservado após processamento
-                if 'behavior' not in df_processed.columns:
-                    tqdm.write(f"⚠️ Coluna 'behavior' perdida após processamento em {file_path.name}")
-
-                relative_path = file_path.relative_to(TRACKING_ROOT)
-                output_file = OUTPUT_PATH / relative_path
-                output_file.parent.mkdir(parents=True, exist_ok=True)
-                df_processed.to_parquet(output_file, engine='fastparquet', index=False)
-                
-                successful += 1
-
-            except Exception as e:
-                tqdm.write(f"\n⚠️ ERRO ao processar {file_path.name}: {e}")
+    success, failed = 0, 0
+    
+    # Loop de processamento
+    for file_path in tqdm(tracking_files, desc="Gerando Features"):
+        try:
+            # 1. Leitura e Preparação
+            df_raw = pd.read_parquet(file_path, engine='fastparquet')
+            
+            # CRÍTICO: Converte Long -> Wide imediatamente
+            df_raw = convert_long_to_wide(df_raw)
+            
+            # Metadata e Merge de Anotações
+            lab_name = file_path.parent.name if file_path.parent.name != 'train_tracking' else 'Unknown'
+            seq_id = file_path.stem
+            
+            ann_df = load_annotation_file(seq_id, lab_name, ANNOTATIONS_ROOT)
+            df_merged = merge_tracking_and_annotations(df_raw, ann_df)
+            df_enriched = inject_metadata_columns(df_merged, seq_id, lab_name, metadata_lookup)
+            
+            # 2. Pipeline de Features Pesado
+            df_final = pipeline_feature_engineering_robust(df_enriched)
+            
+            if df_final.empty:
                 failed += 1
                 continue
 
-        print("\n" + "="*60)
-        print("✅ PROCESSAMENTO CONCLUÍDO")
-        print("="*60)
-        print(f"✅ Arquivos processados com sucesso: {successful}")
-        print(f"❌ Arquivos com erro: {failed}")
-        print(f"\n📊 ESTATÍSTICAS DE LABELS:")
-        print(f"   • Arquivos com labels: {files_with_labels}")
-        print(f"   • Arquivos sem labels: {files_without_labels}")
-        print(f"   • Total de registros com labels: {total_labels_count:,}")
-        if files_with_labels == 0:
-            print("\n   ⚠️ ATENÇÃO: NENHUM arquivo tem labels!")
-            print("   Possíveis causas:")
-            print("   1. Arquivos de anotação não estão no caminho correto")
-            print("   2. Nomes dos arquivos de anotação não correspondem aos de tracking")
-            print("   3. Arquivos de anotação estão vazios ou sem coluna 'behavior'")
-            print("\n   💡 Execute: python diagnose_annotations.py para diagnóstico detalhado")
-        print(f"\n📁 Dados processados salvos em: {OUTPUT_PATH.resolve()}")
-        print("\n💡 Próximos passos:")
-        print("   1. Execute: python consolidate_data_catboost.py")
-        print("   2. Use as variáveis categóricas diretamente no CatBoost (sem OHE)")
-        print("   3. CatBoost lidará automaticamente com valores ausentes")
+            # 3. Salvamento
+            rel_path = file_path.relative_to(TRACKING_ROOT)
+            out_file = OUTPUT_PATH / rel_path
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Salva em Parquet com compressão para não ocupar disco demais
+            df_final.to_parquet(out_file, index=False, compression='snappy')
+            success += 1
+
+        except Exception as e:
+            # tqdm.write(f"⚠️ Falha em {file_path.name}: {e}") # Descomente para debug
+            failed += 1
+
+    print("\n" + "="*50)
+    print(f"✅ FINALIZADO. Sucesso: {success} | Falhas: {failed}")
+    print("="*50)
+    print("Agora rode: python consolidate_data_catboost.py")
