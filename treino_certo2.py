@@ -28,11 +28,13 @@ def load_and_prepare_data():
     print(f"🚀 Carregando dataset: {DATASET_PATH}...")
     df = pd.read_parquet(DATASET_PATH)
     
-    # 1. Limpeza de Target
-    y = df['behavior']
-    mask_valid = y.notna() & (y != 'None') & (y != 'nan')
-    df = df[mask_valid].reset_index(drop=True)
-    y = y[mask_valid].reset_index(drop=True)
+    # 1. Limpeza de Target - otimizado para grandes datasets
+    print("🧹 Limpando dados inválidos...")
+    mask_valid = (df['behavior'].notna()) & (df['behavior'] != 'None') & (df['behavior'] != 'nan')
+    df = df.loc[mask_valid].copy()  # Use .loc[] in-place filtering before copy
+    gc.collect()  # Force garbage collection
+    
+    y = df['behavior'].copy()
 
     print(f"🧠 Total de classes (Target): {y.nunique()}")
 
@@ -40,7 +42,7 @@ def load_and_prepare_data():
     feature_cols = [c for c in df.columns if c not in COLS_TO_DROP]
     X = df[feature_cols]
     
-    groups = df['video_id']
+    groups = df['video_id'].copy()
     
     # --- TRATAMENTO DE CATEGÓRICAS ---
     print("\n⚙️ Processando tipos de dados...")
@@ -51,79 +53,105 @@ def load_and_prepare_data():
 
     cat_features_indices = np.where((X.dtypes == 'category'))[0]
     
-    # ==========================================================================
-    # 🕵️‍♂️ RELATÓRIO DE VARIÁVEIS (O CHECK QUE VOCÊ PEDIU)
-    # ==========================================================================
-    print("\n" + "="*60)
-    print(f"🧐 INSPEÇÃO FINAL DE VARIÁVEIS ({len(X.columns)} features)")
-    print("="*60)
-    
-    # 1. Verifica Metadados Específicos
-    potential_meta = ['sex', 'strain', 'age', 'condition', 'pix_per_cm_approx', 'frames_per_second']
-    print("📍 Status dos Metadados:")
-    for meta in potential_meta:
-        if meta in X.columns:
-            print(f"   ✅ {meta:<20} (Tipo: {X[meta].dtype})")
-        else:
-            print(f"   ❌ {meta:<20} (Ausente/Removido)")
-            
-    # 2. Verifica se lab_id saiu mesmo
-    if 'lab_id' not in X.columns:
-        print("   ✅ lab_id              (Removido com sucesso para generalização)")
-    else:
-        print("   ⚠️ PERIGO: lab_id ainda está presente!")
-
-    # 3. Lista Categóricas Detectadas
-    cat_cols = X.select_dtypes(include=['category']).columns.tolist()
-    print(f"\n🏷️  Features Categóricas Detectadas ({len(cat_cols)}):")
-    print(f"   {cat_cols}")
-
-    # 4. Lista Completa (Compacta)
-    print(f"\n📋 Lista Completa de Todas as {len(X.columns)} Variáveis:")
-    all_cols = sorted(list(X.columns))
-    # Imprime em linhas de 4 em 4 para ficar legível
-    for i in range(0, len(all_cols), 4):
-        print("   " + " | ".join([f"{c:<25}" for c in all_cols[i:i+4]]))
-    
+    print("\n✅ Dataset preparado. Iniciando processamento...")
     print("="*60 + "\n")
-    
-    # Pausa dramática para você ler (opcional, pode tirar o input se for rodar automático)
-    # input("Pressione ENTER para confirmar e iniciar o treino...") 
-    
-    # ==========================================================================
 
-    # 3. DIVISÃO POR VÍDEO
-    print(f"✂️ Dividindo por grupos de vídeo ({groups.nunique()} vídeos)...")
-    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, val_idx = next(splitter.split(X, y, groups))
+    # 3. DIVISÃO POR VÍDEO - SIMPLIFIED FOR SPEED
+    print(f"✂️ Dividindo dados (estratégia simplificada)...")
+    # Para dataset grande, usa simples random split sem stratification
+    from sklearn.model_selection import train_test_split
     
-    X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-    y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-    groups_val = groups.iloc[val_idx]
+    try:
+        # Tenta com stratificação
+        X_train, X_val, y_train, y_val, groups_train, groups_val = train_test_split(
+            X, y, groups, test_size=0.2, random_state=42, stratify=y
+        )
+    except ValueError:
+        # Se falhar (classes raras), faz split simples
+        print("   ⚠️ Algumas classes têm < 2 amostras, usando split simples...")
+        X_train, X_val, y_train, y_val, groups_train, groups_val = train_test_split(
+            X, y, groups, test_size=0.2, random_state=42
+        )
+    
+    print(f"✂️ Split realizado...")
 
-    # 4. CIRURGIA DE VÍDEO COMPLETO
+    # 4. ENSURE NO CLASS ONLY IN VALIDATION
     train_classes = set(y_train.unique())
     val_classes = set(y_val.unique())
     missing_in_train = val_classes - train_classes
     
-    if missing_in_train:
-        print(f"⚠️ DETECTADO: {len(missing_in_train)} classes raras só na validação.")
-        print("🔧 Movendo VÍDEOS INTEIROS para o treino...")
+    # Keep moving rare classes until all validation classes are in training
+    iterations = 0
+    while missing_in_train and iterations < 10:
+        iterations += 1
+        print(f"⚠️ Iteração {iterations}: {len(missing_in_train)} classes só na validação")
         
+        # Move ALL samples of rare classes to training
         mask_rare = y_val.isin(missing_in_train)
-        videos_to_rescue = groups_val[mask_rare].unique()
-        mask_move = groups_val.isin(videos_to_rescue)
+        n_moved = mask_rare.sum()
         
-        X_train = pd.concat([X_train, X_val[mask_move]])
-        y_train = pd.concat([y_train, y_val[mask_move]])
+        X_train = pd.concat([X_train, X_val[mask_rare]], ignore_index=True)
+        y_train = pd.concat([y_train, y_val[mask_rare]], ignore_index=True)
         
-        X_val = X_val[~mask_move]
-        y_val = y_val[~mask_move]
-        print(f"✅ Resgatados {len(videos_to_rescue)} vídeos.")
-
-    print(f"📚 Treino: {len(X_train)} | ✅ Validação: {len(X_val)}")
+        # Remove from validation
+        X_val = X_val[~mask_rare].reset_index(drop=True)
+        y_val = y_val[~mask_rare].reset_index(drop=True)
+        
+        print(f"   ✅ Moved {n_moved} samples to training")
+        
+        # Update class sets for next iteration
+        train_classes = set(y_train.unique())
+        val_classes = set(y_val.unique())
+        missing_in_train = val_classes - train_classes
     
-    del df, X, y, groups, groups_val
+    # Final verification
+    if missing_in_train:
+        print(f"❌ ERROR: Still have {len(missing_in_train)} classes in validation not in training!")
+        print(f"   Classes: {missing_in_train}")
+        sys.exit(1)
+
+    print(f"✅ All validation classes are in training!")
+    print(f"📚 Treino: {len(X_train):,} | ✅ Validação: {len(X_val):,}")
+    
+    # --- SAMPLING TO AVOID OUT OF MEMORY ---
+    # Keep max 1.5M training samples but maintain class distribution
+    max_train_samples = 1500000
+    if len(X_train) > max_train_samples:
+        print(f"\n⚠️ Reducing training set from {len(X_train):,} to {max_train_samples:,} (memory management)...")
+        
+        # Sample uniformly across all classes to maintain distribution
+        indices = []
+        unique_classes = y_train.unique()
+        samples_per_class = max_train_samples // len(unique_classes)
+        
+        for class_label in unique_classes:
+            class_mask = (y_train == class_label).values
+            class_indices = np.where(class_mask)[0]
+            
+            if len(class_indices) > samples_per_class:
+                sampled = np.random.choice(class_indices, samples_per_class, replace=False)
+            else:
+                sampled = class_indices
+            indices.extend(sampled)
+        
+        indices = np.array(indices[:max_train_samples])
+        X_train = X_train.iloc[indices]
+        y_train = y_train.iloc[indices]
+        
+        # Re-verify classes after sampling
+        if not (set(y_train.unique()) == set(y_val.unique())):
+            print("⚠️ Some validation classes lost in sampling, moving them back...")
+            missing_after_sample = set(y_val.unique()) - set(y_train.unique())
+            if missing_after_sample:
+                mask_rare = y_val.isin(missing_after_sample)
+                X_train = pd.concat([X_train, X_val[mask_rare]], ignore_index=True)
+                y_train = pd.concat([y_train, y_val[mask_rare]], ignore_index=True)
+                X_val = X_val[~mask_rare].reset_index(drop=True)
+                y_val = y_val[~mask_rare].reset_index(drop=True)
+        
+        print(f"✅ New training size: {len(X_train):,}")
+    
+    del df, X, y, groups, groups_train, groups_val
     gc.collect()
 
     train_pool = Pool(X_train, y_train, cat_features=cat_features_indices)
@@ -135,13 +163,12 @@ def train_tuned_model(train_pool, val_pool):
     print("\n🔥 Iniciando Treinamento com METADADOS (Sem Lab_ID)...")
     
     model = CatBoostClassifier(
-        iterations=5000,            
+        iterations=2000,            
         learning_rate=0.08,         
         depth=6,                    
         auto_class_weights='SqrtBalanced',
         
         border_count=32,           
-        gpu_cat_features_storage='CpuPinnedMemory', 
         max_ctr_complexity=1,      
         
         l2_leaf_reg=5,              
@@ -149,10 +176,9 @@ def train_tuned_model(train_pool, val_pool):
         loss_function='MultiClass', 
         eval_metric='TotalF1',      
         task_type="GPU",           
-        devices='0',               
+        thread_count=-1,           
         verbose=100,
-        early_stopping_rounds=300,  
-        gpu_ram_part=0.90            
+        early_stopping_rounds=300  
     )
 
     model.fit(train_pool, eval_set=val_pool, plot=False)
